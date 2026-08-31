@@ -1,0 +1,220 @@
+from datetime import date
+from unittest import mock
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+# Neutral default so no test accidentally hits the real RDAP network.
+NEUTRAL_RDAP = {
+    "domain": "example.com",
+    "registered": None,
+    "expires": None,
+    "updated": None,
+    "registrar": None,
+    "nameservers": [],
+    "domain_age_days": None,
+    "status": [],
+    "source": "rdap_unavailable",
+    "notes": ["RDAP request timed out."],
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_network():
+    """Fake the page fetch and default the RDAP lookup to a neutral result."""
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, text="<html><title>Test</title></html>")
+    )
+
+    def fake_async_client(*args, **kwargs):
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    with mock.patch(
+        "app.routers.analyze.httpx.AsyncClient", side_effect=fake_async_client
+    ), mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=NEUTRAL_RDAP,
+    ):
+        yield
+
+
+def _rdap(age_days=None, status=None, source="rdap"):
+    return {
+        "domain": "example.com",
+        "registered": "1995-08-14" if age_days else None,
+        "expires": "2027-08-13",
+        "updated": "2023-07-20",
+        "registrar": "GoDaddy.com, LLC",
+        "nameservers": ["ns1.example.com"],
+        "domain_age_days": age_days,
+        "status": status or [],
+        "source": source,
+        "notes": [],
+    }
+
+
+def _analyze(url="https://example.com/"):
+    return client.post("/api/analyze/", json={"url": url})
+
+
+# ---------- Normal domain with successful RDAP ----------
+
+def test_analyze_normal_domain_with_rdap():
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=(date.today() - date(1995, 8, 14)).days, status=["ok"]),
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["domain"] == "example.com"
+    assert data["domain_intel"]["source"] == "rdap"
+    assert data["domain_intel"]["domain_age_days"] > 0
+    assert data["domain_intel"]["registrar"] == "GoDaddy.com, LLC"
+    assert data["domain_intel"]["nameservers"] == ["ns1.example.com"]
+
+
+# ---------- Old domain ----------
+
+def test_analyze_old_domain_small_boost():
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=12000, status=["ok"]),
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    # example.com is "moderate" (score 65); old age adds a bounded +5.
+    assert data["trust_score"] == 70
+    assert any("well-established" in f.lower() for f in data["green_flags"])
+    assert data["domain_age"] == "32 years, 10 months"
+
+
+# ---------- Very young domain ----------
+
+def test_analyze_young_domain_small_penalty():
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=10, status=["ok"]),
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 60
+    assert any("recently" in f.lower() for f in data["red_flags"])
+    assert data["domain_age"] == "10 days"
+
+
+# ---------- Hold / suspension status ----------
+
+def test_analyze_hold_status_negative():
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=500, status=["clientHold"]),
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 60
+    assert any("suspension" in f.lower() for f in data["red_flags"])
+
+
+# ---------- Missing RDAP fields (neutral) ----------
+
+def test_analyze_missing_rdap_fields_neutral():
+    missing = {
+        "domain": "example.com",
+        "registered": None,
+        "expires": None,
+        "updated": None,
+        "registrar": None,
+        "nameservers": [],
+        "domain_age_days": None,
+        "status": [],
+        "source": "rdap",
+        "notes": ["RDAP did not provide a registration date."],
+    }
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=missing,
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 65  # unchanged from baseline
+    assert data["domain_age"] == "3 years"  # safe fallback preserved
+    assert data["domain_intel"]["source"] == "rdap"
+    assert data["domain_intel"]["domain_age_days"] is None
+
+
+# ---------- RDAP unavailable (no score change) ----------
+
+def test_analyze_rdap_unavailable_keeps_score():
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=NEUTRAL_RDAP,
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 65
+    assert data["domain_age"] == "3 years"
+    assert data["domain_intel"]["source"] == "rdap_unavailable"
+
+
+# ---------- RDAP failure must not break /api/analyze ----------
+
+def test_analyze_succeeds_when_rdap_raises():
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        side_effect=RuntimeError("boom"),
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 65
+    assert data["domain_age"] == "3 years"
+    assert data["domain_intel"] is None
+
+
+# ---------- Existing behavior intact ----------
+
+def test_analyze_trusted_domain_existing_behavior():
+    # github.com matches the existing trusted pattern (score 95 baseline).
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=NEUTRAL_RDAP,
+    ):
+        resp = _analyze("https://github.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 95
+    assert data["category"] == "trusted"
+    assert data["domain_intel"]["source"] == "rdap_unavailable"
+
+
+def test_analyze_invalid_url_rejected():
+    resp = client.post("/api/analyze/", json={"url": "not-a-url"})
+    assert resp.status_code == 422

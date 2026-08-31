@@ -7,6 +7,9 @@ import os
 import asyncio
 import re
 
+from app.services.evidence import evaluate_rdap_evidence, format_domain_age
+from app.services.rdap import normalize_domain, rdap_lookup
+
 router = APIRouter(prefix="/api/analyze", tags=["analysis"])
 
 class AnalyzeRequest(BaseModel):
@@ -25,6 +28,7 @@ class AnalyzeResponse(BaseModel):
     domain: str
     domain_age: Optional[str] = None
     ssl_valid: Optional[bool] = None
+    domain_intel: Optional[Dict[str, Any]] = None
 
 # ============================================
 # Mock Data (Replace with real API calls)
@@ -150,6 +154,36 @@ async def analyze_website(
     red_flags = analysis["red_flags"]
     green_flags = analysis["green_flags"]
     summary = analysis["summary"]
+    domain_age = analysis.get("domain_age", "Unknown")
+
+    # Integrate real RDAP intelligence (additive, conservative, never fatal).
+    domain_intel = None
+    try:
+        normalized = normalize_domain(domain)
+        if normalized is not None:
+            rdap = await rdap_lookup(normalized)
+            domain_intel = {
+                "domain": normalized,
+                "registered": rdap.get("registered"),
+                "expires": rdap.get("expires"),
+                "updated": rdap.get("updated"),
+                "registrar": rdap.get("registrar"),
+                "nameservers": rdap.get("nameservers") or [],
+                "domain_age_days": rdap.get("domain_age_days"),
+                "status": rdap.get("status") or [],
+                "source": rdap.get("source", "rdap_unavailable"),
+                "notes": rdap.get("notes") or None,
+            }
+            evidence = evaluate_rdap_evidence(rdap)
+            trust_score = max(0.0, min(100.0, trust_score + evidence["score_delta"]))
+            red_flags = red_flags + evidence["red_flags"]
+            green_flags = green_flags + evidence["green_flags"]
+            age_days = rdap.get("domain_age_days")
+            if isinstance(age_days, int) and age_days >= 0:
+                domain_age = format_domain_age(age_days)
+    except Exception:
+        # RDAP must never break the analysis; fall back to existing behavior.
+        domain_intel = None
     
     return AnalyzeResponse(
         url=str(request.url),
@@ -161,8 +195,9 @@ async def analyze_website(
         summary=summary,
         analyzed_at=datetime.now(),
         domain=domain,
-        domain_age=analysis.get("domain_age", "Unknown"),
-        ssl_valid=analysis.get("ssl_valid", None)
+        domain_age=domain_age,
+        ssl_valid=analysis.get("ssl_valid", None),
+        domain_intel=domain_intel
     )
 
 @router.get("/test")
