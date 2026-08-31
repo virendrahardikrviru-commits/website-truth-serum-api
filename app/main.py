@@ -47,4 +47,6 @@ async def health_check():
 
 # Import and include routers
 from app.routers import analyze
+from app.routers import domain_intel  # 👈 NEW
 app.include_router(analyze.router)
+app.include_router(domain_intel.router)  # 👈 NEW
