@@ -179,8 +179,8 @@ def test_security_headers_reconciles_under_cap():
 def test_assembly_rdap_tls_http_security_headers():
     rdap = rdap_evidence_items({"source": "rdap", "domain_age_days": 4000, "status": []})
     tls = [
-        EvidenceItem(id="TLS_001", category="ssl", signal="ssl_valid", value="TLSv1.3",
-                     effect=8.0, confidence=1.0, source="tls"),
+        EvidenceItem(id="TLS_001", category="ssl", signal="ssl_valid",
+                     value="TLSv1.3", effect=6.0, confidence=1.0, source="tls"),
     ]
     http = [
         EvidenceItem(id="HTTP_HTTPS", category="http", signal="https_ok",
@@ -188,9 +188,9 @@ def test_assembly_rdap_tls_http_security_headers():
     ]
     headers = _analyze_headers(httpx.Headers(GOOD_HEADERS))
     result = evaluate_evidence(rdap + tls + http + headers)
-    # 50 + 5 (domain) + 8 (ssl) + 2 (http) + 5 (headers capped) = 70
-    assert result.score == 70.0
+    # 50 + 5 (domain) + 6 (ssl) + 2 (http) + 5 (headers capped) = 68
+    assert result.score == 68.0
     assert result.category_contributions == {
-        "domain": 5.0, "ssl": 8.0, "http": 2.0, "security_headers": 5.0,
+        "domain": 5.0, "ssl": 6.0, "http": 2.0, "security_headers": 5.0,
     }
     assert result.confidence > 0.5  # 4 of 11 planned categories usable

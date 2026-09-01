@@ -60,7 +60,7 @@ def test_tls_valid(monkeypatch):
     item = items[0]
     assert item.category == "ssl"
     assert item.signal == "ssl_valid"
-    assert item.effect == 8.0
+    assert item.effect == 6.0
     assert item.source == "tls"
     assert item.value["tls_version"] == "TLSv1.3"
 
@@ -171,15 +171,15 @@ def test_evidence_assembly_rdap_tls_http():
     rdap = rdap_evidence_items({"source": "rdap", "domain_age_days": 4000, "status": []})
     tls = [
         EvidenceItem(id="TLS_001", category="ssl", signal="ssl_valid", value="TLSv1.3",
-                     effect=8.0, confidence=1.0, source="tls"),
+                     effect=6.0, confidence=1.0, source="tls"),
     ]
     http = [
         EvidenceItem(id="HTTP_HTTPS", category="http", signal="https_ok",
                      effect=2.0, confidence=1.0, source="http"),
     ]
     result = evaluate_evidence(rdap + tls + http)
-    assert result.score == 65.0  # 50 + 5 (domain) + 8 (ssl) + 2 (http)
-    assert result.category_contributions == {"domain": 5.0, "ssl": 8.0, "http": 2.0}
+    assert result.score == 63.0  # 50 + 5 (domain) + 6 (ssl) + 2 (http)
+    assert result.category_contributions == {"domain": 5.0, "ssl": 6.0, "http": 2.0}
     assert len(result.applied_evidence) == 3
     assert result.confidence > 0.5
 

@@ -1,10 +1,13 @@
-"""TLS/SSL evidence collector (Phase 2b).
+"""TLS/SSL evidence collector (Phase 2b, calibrated Phase 2c-4).
 
 Performs a real HTTPS handshake with certificate verification enabled
 (Python's ``ssl`` with the default context — verification is never disabled)
 and emits evidence only for what was actually measured:
 
-- Valid certificate/handshake -> ``+8`` (``ssl_valid``).
+- Valid certificate/handshake -> ``+6`` (``ssl_valid``). This rewards the
+  *transport security* property specifically: that the site presents a valid,
+  verified certificate chain. It is distinct from the HTTP behavior signal
+  (``https_ok``, ``+2``) which rewards successful HTTPS *reachability*.
 - Certificate verification or handshake failure -> ``-10`` (``ssl_error``).
 - Timeout / network / provider failure -> no evidence (effect 0, no penalty).
 
@@ -77,7 +80,7 @@ def _collect_tls_sync(domain: str) -> List[EvidenceItem]:
                 "cert_not_after": cert.get("notAfter"),
                 "issuer": cert.get("issuer"),
             },
-            effect=8.0,
+            effect=6.0,
             confidence=1.0,
             source="tls",
             explanation=f"Valid TLS certificate; connection negotiated {version}.",

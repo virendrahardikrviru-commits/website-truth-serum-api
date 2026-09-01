@@ -298,5 +298,54 @@ def test_category_mapping_bands():
             ]
         )
     assert high.score == 80.0
-    assert high.category == "trusted"
-    assert high.risk_level == "low"
+    # Breadth guard: a high score from a single category is not "trusted".
+    assert high.category == "moderate"
+    assert high.risk_level == "moderate"
+    assert any("Trusted classification" in n for n in high.notes)
+
+
+def _bulk(category, effect, count):
+    return [
+        EvidenceItem(id=f"{category}_{i}", category=category, signal="x",
+                     effect=effect, confidence=1.0, source="test")
+        for i in range(count)
+    ]
+
+
+def test_trusted_requires_four_usable_categories():
+    # score >= 75 with only 3 usable categories -> moderate + transparent note.
+    items = (
+        _bulk("domain", 5.0, 2)
+        + _bulk("ssl", 6.0, 2)
+        + _bulk("security_headers", 3.0, 2)
+    )
+    result = evaluate_evidence(items)
+    assert result.score == 75.0  # 10 (domain) + 10 (ssl) + 5 (headers)
+    assert {i.category for i in result.applied_evidence} == {
+        "domain", "ssl", "security_headers",
+    }
+    assert result.category == "moderate"
+    assert result.risk_level == "moderate"
+    assert any("Trusted classification" in n for n in result.notes)
+    # Confidence reflects the 3 usable categories, unaffected by the downgrade.
+    assert result.confidence == pytest.approx(0.53)
+
+
+def test_trusted_with_four_usable_categories():
+    items = (
+        _bulk("domain", 5.0, 2)
+        + _bulk("ssl", 6.0, 2)
+        + _bulk("security_headers", 3.0, 2)
+        + _bulk("http", 3.0, 2)
+    )
+    result = evaluate_evidence(items)
+    assert result.score == 80.0  # 10 + 10 + 5 + 5
+    assert result.category == "trusted"
+    assert result.risk_level == "low"
+    assert not any("Trusted classification" in n for n in result.notes)
+
+
+def test_breadth_guard_not_applied_below_trusted_band():
+    result = evaluate_evidence([age_item(5.0, 4000)])  # 55, 1 category
+    assert result.category == "moderate"
+    assert not any("Trusted classification" in n for n in result.notes)

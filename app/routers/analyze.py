@@ -10,6 +10,7 @@ import re
 from app.models.evidence import EvidenceItem
 from app.services.collectors.content import analyze_page_content
 from app.services.collectors.http_behavior import collect_http
+from app.services.collectors.reputation import collect_reputation
 from app.services.collectors.security_headers import collect_security_headers
 from app.services.collectors.ssl import collect_tls
 from app.services.evidence import (
@@ -216,6 +217,11 @@ async def analyze_website(
                 items = items + analyze_page_content(html)
             except Exception:
                 pass
+            if os.getenv("REPUTATION_ENABLED", "false").lower() == "true":
+                try:
+                    items = items + await collect_reputation(normalized)
+                except Exception:
+                    pass  # a collector must never break the analysis
         result = evaluate_evidence(items)
         trust_score = result.score
         confidence = result.confidence

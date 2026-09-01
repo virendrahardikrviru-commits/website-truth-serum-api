@@ -1,7 +1,7 @@
 import httpx
 
 from app.models.evidence import EvidenceItem
-from app.services.collectors.content import analyze_page_content
+from app.services.collectors.content import _metadata_effect, analyze_page_content
 from app.services.collectors.http_behavior import collect_http
 from app.services.collectors.security_headers import _analyze_headers
 from app.services.collectors.ssl import collect_tls
@@ -34,36 +34,50 @@ def _signals(items):
     return {i.signal: i.effect for i in items}
 
 
-def test_all_content_signals_present():
+# ---------- Metadata aggregation ----------
+
+def test_all_content_signals_present_with_aggregation():
     items = analyze_page_content(RICH)
     effects = _signals(items)
-    assert effects["title_present"] == 1.0
-    assert effects["description_present"] == 1.0
-    assert effects["lang_present"] == 1.0
-    assert effects["viewport_present"] == 1.0
-    assert effects["canonical_present"] == 1.0
-    assert effects["alt_text_present"] == 1.0
+    assert effects["metadata_quality"] == 3.0  # aggregated, not 6 separate points
     assert effects["substantial_content"] == 1.0
+    # Individual routine-metadata observations stay visible but neutralized.
+    for signal in ("title_present", "description_present", "lang_present",
+                   "viewport_present", "canonical_present", "alt_text_present"):
+        assert effects[signal] == 0.0
     assert "no_title" not in effects
-    assert all(effect > 0 for effect in effects.values())
+    assert not any(effect < 0 for effect in effects.values())
+    # 6 neutralized observations + metadata_quality + substantial = 8 items.
+    assert len(items) == 8
     for item in items:
         assert item.category == "content"
         assert item.source == "content"
         assert isinstance(item.explanation, str) and item.explanation
 
 
+def test_metadata_quality_tiering():
+    assert _metadata_effect(6) == 3.0
+    assert _metadata_effect(4) == 2.0
+    assert _metadata_effect(2) == 1.0
+    assert _metadata_effect(1) == 0.0
+    assert _metadata_effect(0) == 0.0
+
+
 def test_meta_description_both_attribute_orders():
     later = f"""<html><head><meta content="Desc here" name="description"></head>
     <body><p>{BODY}</p></body></html>"""
     items = analyze_page_content(later)
-    assert _signals(items)["description_present"] == 1.0
+    effects = _signals(items)
+    assert effects["description_present"] == 0.0  # observed but neutralized
+    assert effects["metadata_quality"] == 0.0  # only 1 metadata element
 
 
 def test_missing_optional_metadata_is_neutral():
     html = f"<html><head><title>Only Title</title></head><body><p>{BODY}</p></body></html>"
     items = analyze_page_content(html)
     effects = _signals(items)
-    assert effects["title_present"] == 1.0
+    assert effects["title_present"] == 0.0
+    assert effects["metadata_quality"] == 0.0  # 1 of 6 -> no metadata credit
     assert effects["substantial_content"] == 1.0
     # Optional metadata absent -> neutral, never negative.
     for signal in ("description_present", "lang_present", "viewport_present",
@@ -73,23 +87,28 @@ def test_missing_optional_metadata_is_neutral():
 
 
 def test_minimal_page_never_penalized():
-    # Short/minimal HTML must not be treated as empty or untrustworthy.
     minimal = "<html><head><title>X</title></head><body><p>Hi</p></body></html>"
     items = analyze_page_content(minimal)
     effects = _signals(items)
-    assert effects == {"title_present": 1.0}
+    assert effects["title_present"] == 0.0
+    assert effects["metadata_quality"] == 0.0
+    assert "substantial_content" not in effects
     assert not any(effect < 0 for effect in effects.values())
 
 
 def test_minimal_page_without_title_never_penalized():
     html = "<html><body><p>Hello world</p></body></html>"
-    assert analyze_page_content(html) == []
+    items = analyze_page_content(html)
+    effects = _signals(items)
+    assert effects == {"metadata_quality": 0.0}
+    assert not any(effect < 0 for effect in effects.values())
 
 
 def test_no_title_penalized_only_for_substantial_page():
     html = f"<html><body><p>{BODY}</p></body></html>"
     items = analyze_page_content(html)
     effects = _signals(items)
+    assert effects["metadata_quality"] == 0.0
     assert effects["substantial_content"] == 1.0
     assert effects["no_title"] == -1.0
 
@@ -99,7 +118,7 @@ def test_script_content_does_not_count_as_substantial():
     <script>{"var x = 'y';" * 5000}</script></body></html>"""
     items = analyze_page_content(html)
     effects = _signals(items)
-    assert effects.get("title_present") == 1.0
+    assert effects.get("title_present") == 0.0
     assert "substantial_content" not in effects
     assert "no_title" not in effects
 
@@ -110,15 +129,30 @@ def test_empty_or_none_html_is_neutral():
     assert analyze_page_content("   \n  ") == []
 
 
-def test_content_category_cap():
-    items = analyze_page_content(RICH)  # 7 positive signals
+# ---------- Content category behaviour in the engine ----------
+
+def test_content_aggregation_is_bounded_below_cap():
+    items = analyze_page_content(RICH)  # metadata +3, substantial +1
     result = evaluate_evidence(items)
-    assert result.category_contributions["content"] == 5.0  # capped, not 7
+    assert result.category_contributions["content"] == 4.0  # aggregation bound, not clamp
+    assert result.score == 54.0
+    assert not any("cap" in n and "content" in n for n in result.notes)
+
+
+def test_content_category_cap_still_enforced():
+    # Hand-built content items far exceeding the cap must still be clamped.
+    items = [
+        EvidenceItem(id=f"C{i}", category="content", signal="sig", effect=1.0,
+                     confidence=1.0, source="content")
+        for i in range(8)
+    ]
+    result = evaluate_evidence(items)
+    assert result.category_contributions["content"] == 5.0
     assert result.score == 55.0
     assert any("cap" in n and "content" in n for n in result.notes)
 
 
-def test_content_reconciles_under_cap():
+def test_content_reconciles():
     items = analyze_page_content(RICH)
     result = evaluate_evidence(items)
     assert result.score == round(50.0 + sum(result.category_contributions.values()), 2)
@@ -128,7 +162,7 @@ def test_assembly_with_content():
     rdap = rdap_evidence_items({"source": "rdap", "domain_age_days": 4000, "status": []})
     tls = [
         EvidenceItem(id="TLS_001", category="ssl", signal="ssl_valid",
-                     value="TLSv1.3", effect=8.0, confidence=1.0, source="tls"),
+                     value="TLSv1.3", effect=6.0, confidence=1.0, source="tls"),
     ]
     http = [
         EvidenceItem(id="HTTP_HTTPS", category="http", signal="https_ok",
@@ -140,11 +174,11 @@ def test_assembly_with_content():
     }))
     content = analyze_page_content(RICH)
     result = evaluate_evidence(rdap + tls + http + headers + content)
-    # 50 + 5 (domain) + 8 (ssl) + 2 (http) + 2 (headers) + 5 (content capped) = 72
-    assert result.score == 72.0
+    # 50 + 5 + 6 + 2 + 2 (headers) + 4 (content) = 69
+    assert result.score == 69.0
     assert result.category_contributions == {
-        "domain": 5.0, "ssl": 8.0, "http": 2.0,
-        "security_headers": 2.0, "content": 5.0,
+        "domain": 5.0, "ssl": 6.0, "http": 2.0,
+        "security_headers": 2.0, "content": 4.0,
     }
     assert result.confidence == 0.65  # 5 of 11 planned categories usable
 

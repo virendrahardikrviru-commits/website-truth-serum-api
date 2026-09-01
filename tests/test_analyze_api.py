@@ -381,14 +381,14 @@ def test_evidence_mode_tls_valid(evidence_mode):
     with mock.patch(
         "app.routers.analyze.collect_tls",
         new_callable=mock.AsyncMock,
-        return_value=[_tls_item(8.0)],
+        return_value=[_tls_item(6.0)],
     ):
         resp = _analyze()
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["trust_score"] == 58  # 50 + 8
-    assert data["category_contributions"]["ssl"] == 8.0
+    assert data["trust_score"] == 56  # 50 + 6
+    assert data["category_contributions"]["ssl"] == 6.0
     assert any(e["signal"] == "ssl_valid" for e in data["evidence"])
 
 
@@ -428,7 +428,7 @@ def test_evidence_mode_combined_rdap_tls_http(evidence_mode):
     ), mock.patch(
         "app.routers.analyze.collect_tls",
         new_callable=mock.AsyncMock,
-        return_value=[_tls_item(8.0)],
+        return_value=[_tls_item(6.0)],
     ), mock.patch(
         "app.routers.analyze.collect_http",
         new_callable=mock.AsyncMock,
@@ -438,8 +438,8 @@ def test_evidence_mode_combined_rdap_tls_http(evidence_mode):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["trust_score"] == 65  # 50 + 5 (domain) + 8 (ssl) + 2 (http)
-    assert data["category_contributions"] == {"domain": 5.0, "ssl": 8.0, "http": 2.0}
+    assert data["trust_score"] == 63  # 50 + 5 (domain) + 6 (ssl) + 2 (http)
+    assert data["category_contributions"] == {"domain": 5.0, "ssl": 6.0, "http": 2.0}
     assert data["confidence"] == 0.53  # 3 of 11 planned categories usable
     assert len(data["evidence"]) == 3
 
@@ -517,3 +517,36 @@ def test_evidence_mode_content(evidence_mode):
     assert content_mock.call_count == 1
     html_arg = content_mock.call_args.args[0]
     assert isinstance(html_arg, str) and "<html>" in html_arg
+
+
+def test_evidence_mode_reputation_disabled_by_default(evidence_mode):
+    # REPUTATION_ENABLED unset -> the reputation collector must not run.
+    with mock.patch(
+        "app.routers.analyze.collect_reputation",
+        new_callable=mock.AsyncMock,
+    ) as reputation_mock:
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    reputation_mock.assert_not_called()
+
+
+def test_evidence_mode_reputation_enabled(evidence_mode):
+    negative = EvidenceItem(
+        id="REP_MALWARE", category="reputation", signal="malware_hit",
+        value={"threat": "malware", "reported_by": ["urlhaus"]},
+        effect=-10.0, confidence=0.6, source="reputation",
+        explanation="malware confirmed by 1 provider(s): urlhaus.",
+    )
+    with mock.patch.dict(os.environ, {"REPUTATION_ENABLED": "true"}), mock.patch(
+        "app.routers.analyze.collect_reputation",
+        new_callable=mock.AsyncMock,
+        return_value=[negative],
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 44  # 50 + (-10 * 0.6)
+    assert data["category_contributions"]["reputation"] == -6.0
+    assert any(e["signal"] == "malware_hit" for e in data["evidence"])

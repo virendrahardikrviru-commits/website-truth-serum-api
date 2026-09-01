@@ -27,6 +27,12 @@ from app.models.evidence import EvidenceItem, ScoreResult
 BASE_SCORE = 50.0
 MAX_SIGNAL_EFFECT = 10.0
 
+# A site is classified "trusted" only when its score reaches the trusted band
+# AND at least this many independent evidence categories were usable. This
+# prevents a high score driven by a single strong category from being labeled
+# trustworthy. Applied to the evidence engine only (legacy mode never uses it).
+TRUSTED_MIN_CATEGORIES = 4
+
 # Categories with an active, conservative score influence. A category only
 # becomes active when its collector actually exists and is trusted.
 CATEGORY_CAPS: Dict[str, float] = {
@@ -35,6 +41,7 @@ CATEGORY_CAPS: Dict[str, float] = {
     "http": 5.0,
     "security_headers": 5.0,
     "content": 5.0,
+    "reputation": 15.0,
 }
 
 # The full planned evidence surface. Used as the confidence denominator so
@@ -137,6 +144,18 @@ def evaluate_evidence(items: List[EvidenceItem]) -> ScoreResult:
         confidence = 0.0
 
     category, risk_level = _band(score)
+
+    # Trusted-breadth guard: a trusted label requires enough independent
+    # evidence categories, otherwise the numeric score is preserved but the
+    # label is transparently downgraded to moderate.
+    if category == "trusted" and len(usable_categories) < TRUSTED_MIN_CATEGORIES:
+        category = "moderate"
+        risk_level = "moderate"
+        notes.append(
+            f"Trusted classification requires at least {TRUSTED_MIN_CATEGORIES} "
+            f"usable evidence categories; only {len(usable_categories)} were "
+            "available, so the site is classified as moderate."
+        )
 
     return ScoreResult(
         score=score,

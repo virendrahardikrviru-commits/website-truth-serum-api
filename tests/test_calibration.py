@@ -61,7 +61,7 @@ def _item(category, signal, effect, value=None, explanation="Observed signal."):
 
 
 def tls_valid():
-    return _item("ssl", "ssl_valid", 8.0, "TLSv1.3", "Valid TLS certificate.")
+    return _item("ssl", "ssl_valid", 6.0, "TLSv1.3", "Valid TLS certificate.")
 
 
 def tls_error():
@@ -147,9 +147,9 @@ def test_matrix_B_strong_legitimate_site():
     )
     result = assert_reconciliation(
         items,
-        expected_contribs={"domain": 5.0, "ssl": 8.0, "http": 4.0,
-                           "security_headers": 5.0, "content": 5.0},
-        expected_score=77.0,
+        expected_contribs={"domain": 5.0, "ssl": 6.0, "http": 4.0,
+                           "security_headers": 5.0, "content": 4.0},
+        expected_score=74.0,
         expected_conf=0.65,  # 5 of 11 planned categories usable
     )
     assert result.negative_signals == []
@@ -168,9 +168,9 @@ def test_matrix_C_ordinary_site_incomplete_metadata():
     )
     result = assert_reconciliation(
         items,
-        expected_contribs={"domain": 0.0, "ssl": 8.0, "http": 2.0,
-                           "security_headers": 2.0, "content": 2.0},
-        expected_score=64.0,
+        expected_contribs={"domain": 0.0, "ssl": 6.0, "http": 2.0,
+                           "security_headers": 2.0, "content": 1.0},
+        expected_score=61.0,
         expected_conf=0.65,
     )
     # Missing optional metadata must not create penalties.
@@ -215,9 +215,9 @@ def test_matrix_E_mixed_site():
     )
     result = assert_reconciliation(
         items,
-        expected_contribs={"domain": 0.0, "ssl": 8.0, "http": 1.0,
-                           "security_headers": 5.0, "content": 5.0},
-        expected_score=69.0,
+        expected_contribs={"domain": 0.0, "ssl": 6.0, "http": 1.0,
+                           "security_headers": 5.0, "content": 4.0},
+        expected_score=66.0,
         # conflict within security_headers halves confidence
         expected_conf=0.45,
     )
@@ -230,12 +230,11 @@ def test_matrix_F_single_category_dominance():
     items = [tls_valid(), tls_valid(), tls_valid()] + analyze_page_content(RICH)
     result = assert_reconciliation(
         items,
-        expected_contribs={"ssl": 10.0, "content": 5.0},
-        expected_score=65.0,
+        expected_contribs={"ssl": 10.0, "content": 4.0},
+        expected_score=64.0,
         expected_conf=0.47,  # 2 of 11 usable
     )
     assert any("cap" in n and "ssl" in n for n in result.notes)
-    assert any("cap" in n and "content" in n for n in result.notes)
 
 
 def test_unavailable_categories_contribute_exactly_zero():
