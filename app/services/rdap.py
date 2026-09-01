@@ -178,7 +178,10 @@ async def rdap_lookup(
 
     owns_client = client is None
     if client is None:
-        client = httpx.AsyncClient(timeout=RDAP_TIMEOUT, follow_redirects=True)
+        # Redirects are disabled: an unguarded redirect could redirect a scan
+        # to an internal target, and RDAP servers are expected to answer
+        # directly. A 3xx is treated as an unavailable result.
+        client = httpx.AsyncClient(timeout=RDAP_TIMEOUT, follow_redirects=False)
 
     try:
         bootstrap = await _load_bootstrap(client)

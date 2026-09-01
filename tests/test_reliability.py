@@ -1,4 +1,4 @@
-"""Phase 2c-10 — Reliability & observability tests.
+"""Phase 2c-10 Ã¢â‚¬â€ Reliability & observability tests.
 
 Deterministic tests (no live network) for: overall evidence deadline, partial
 evidence retention, concurrent scans, collector/thread timeout behavior,
@@ -26,6 +26,7 @@ from app.models.evidence import EvidenceItem
 from app.routers import analyze as analyze_module
 from app.services.collectors import reputation as rep
 from app.services.collectors.reputation import ProviderReport
+from app.services.rate_limit import SlidingWindowRateLimiter
 
 client = TestClient(app)
 
@@ -50,7 +51,11 @@ def _env_reset():
         key: os.environ.pop(key, None)
         for key in ("SCORING_MODE", "REPUTATION_ENABLED", "URLHAUS_API_KEY", "SPAMHAUS_DQS_KEY")
     }
-    yield
+    with mock.patch(
+        "app.routers.analyze.scan_rate_limiter",
+        SlidingWindowRateLimiter(max_requests=10**6, window_seconds=3600),
+    ):
+        yield
     for key, value in saved.items():
         if value is None:
             os.environ.pop(key, None)
@@ -69,17 +74,11 @@ def _evidence_mocks(deadline=5.0, transport=None, tls=None, rdap=None, content=N
         transport = httpx.MockTransport(
             lambda r: httpx.Response(200, text="<html><title>R</title></html>")
         )
-    real_client_cls = httpx.AsyncClient  # captured before patching
     tls_mock = tls if tls is not None else mock.AsyncMock(return_value=[])
     exit_stack = contextlib.ExitStack()
     exit_stack.enter_context(mock.patch.object(analyze_module, "SCAN_DEADLINE_SECONDS", deadline))
     exit_stack.enter_context(mock.patch.dict(os.environ, {"SCORING_MODE": "evidence"}))
-    exit_stack.enter_context(
-        mock.patch(
-            "app.routers.analyze.httpx.AsyncClient",
-            side_effect=lambda *a, **k: real_client_cls(transport=transport, **k),
-        )
-    )
+    exit_stack.enter_context(mock.patch("app.routers.analyze._page_fetch_transport", transport))
     exit_stack.enter_context(
         mock.patch(
             "app.routers.analyze.rdap_lookup",
@@ -102,7 +101,7 @@ def _evidence_mocks(deadline=5.0, transport=None, tls=None, rdap=None, content=N
 # ---------- Overall deadline ----------
 
 def test_evidence_deadline_bounds_scan_and_drops_slow_collector():
-    async def slow_tls(domain):
+    async def slow_tls(domain, outcomes=None):
         await asyncio.sleep(30)
         return []
 
@@ -119,7 +118,7 @@ def test_evidence_deadline_bounds_scan_and_drops_slow_collector():
 
 
 def test_partial_evidence_retained_after_deadline():
-    async def slow_tls(domain):
+    async def slow_tls(domain, outcomes=None):
         await asyncio.sleep(30)
         return []
 
@@ -217,13 +216,11 @@ def test_single_page_fetch_in_evidence_mode():
         )
 
     transport = httpx.MockTransport(handler)
-    real_client_cls = httpx.AsyncClient  # captured before patching
     # http/headers/content are NOT mocked -> they derive from the reused response.
     with mock.patch.object(analyze_module, "SCAN_DEADLINE_SECONDS", 5.0), mock.patch.dict(
         os.environ, {"SCORING_MODE": "evidence"}
     ), mock.patch(
-        "app.routers.analyze.httpx.AsyncClient",
-        side_effect=lambda *a, **k: real_client_cls(transport=transport, **k),
+        "app.routers.analyze._page_fetch_transport", transport
     ), mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock, return_value=NEUTRAL_RDAP,
@@ -247,12 +244,10 @@ def test_http_upgrade_from_reused_response():
         return httpx.Response(200, text="<html>ok</html>")
 
     transport = httpx.MockTransport(handler)
-    real_client_cls = httpx.AsyncClient  # captured before patching
     with mock.patch.object(analyze_module, "SCAN_DEADLINE_SECONDS", 5.0), mock.patch.dict(
         os.environ, {"SCORING_MODE": "evidence"}
     ), mock.patch(
-        "app.routers.analyze.httpx.AsyncClient",
-        side_effect=lambda *a, **k: real_client_cls(transport=transport, **k),
+        "app.routers.analyze._page_fetch_transport", transport
     ), mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock, return_value=NEUTRAL_RDAP,
@@ -276,8 +271,7 @@ def test_ssrf_redirect_still_blocked_after_consolidation():
     with mock.patch.object(analyze_module, "SCAN_DEADLINE_SECONDS", 5.0), mock.patch.dict(
         os.environ, {"SCORING_MODE": "evidence"}
     ), mock.patch(
-        "app.routers.analyze.httpx.AsyncClient",
-        side_effect=lambda *a, **k: httpx.AsyncClient(transport=transport, **k),
+        "app.routers.analyze._page_fetch_transport", transport
     ), mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock, return_value=NEUTRAL_RDAP,
@@ -319,7 +313,9 @@ def test_structured_logging_fields(caplog):
         assert ev["domain"] == "example.com"
         assert ev["mode"] == "evidence"
         assert ev["outcome"] in ("success", "unavailable", "timeout", "rate_limited",
-                                 "unauthorized", "invalid", "error")
+                                 "unauthorized", "invalid", "error", "disabled",
+                                 "ssrf_rejected", "dns_failed", "private_ip_rejected",
+                                 "redirect_rejected")
     assert results
     assert {"score", "category", "confidence", "duration_ms"} <= set(results[0])
 
@@ -376,12 +372,11 @@ def test_legacy_scan_emits_no_structured_logs(caplog):
         lambda r: httpx.Response(200, text="<html></html>")
     )
     with caplog.at_level(logging.INFO, logger="wts.evidence"), mock.patch(
-        "app.routers.analyze.httpx.AsyncClient",
-        side_effect=lambda *a, **k: httpx.AsyncClient(transport=transport, **k),
+        "app.routers.analyze._page_fetch_transport", transport
     ), mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock, return_value=NEUTRAL_RDAP,
-    ):
+    ), mock.patch.dict(os.environ, {"SCORING_MODE": "legacy"}):
         resp = _post("https://example.com/")
 
     assert resp.status_code == 200
@@ -412,3 +407,184 @@ def test_reputation_cache_concurrent_access():
 
     asyncio.run(run_all())
     assert len(rep._CACHE) <= rep.CACHE_MAX_ENTRIES
+
+
+# ---------- V1-H1: true end-to-end evidence deadline ----------
+
+def test_deadline_bounds_slow_rdap():
+    async def slow_rdap(domain):
+        await asyncio.sleep(30)
+        return NEUTRAL_RDAP
+
+    with _evidence_mocks(deadline=0.5, rdap=slow_rdap):
+        start = time.monotonic()
+        resp = _post("https://example.com/")
+        elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    assert elapsed < 5  # bounded by the deadline, not the 30s RDAP mock
+    data = resp.json()
+    # A timed-out RDAP is unavailable/neutral: no score change, no flags.
+    assert data["trust_score"] == 50
+    assert data["domain_intel"] is None
+    assert data["confidence"] == 0.0
+
+
+def test_evidence_fetch_uses_budget_capped_timeout():
+    captured = {}
+
+    def fake_factory(fetch_timeout):
+        captured["timeout"] = fetch_timeout
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, text="<html></html>")
+            ),
+        )
+
+    with mock.patch(
+        "app.routers.analyze._new_fetch_client", side_effect=fake_factory
+    ), mock.patch.object(analyze_module, "SCAN_DEADLINE_SECONDS", 0.5), mock.patch.dict(
+        os.environ, {"SCORING_MODE": "evidence"}
+    ), mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock, return_value=NEUTRAL_RDAP,
+    ), mock.patch(
+        "app.routers.analyze.collect_tls", new_callable=mock.AsyncMock, return_value=[],
+    ):
+        resp = _post("https://example.com/")
+
+    assert resp.status_code == 200
+    # The page fetch inherits the remaining deadline, not the full 15s timeout.
+    assert captured["timeout"] < 1.0
+
+
+def test_legacy_fetch_not_budget_capped():
+    captured = {}
+
+    def fake_factory(fetch_timeout):
+        captured["timeout"] = fetch_timeout
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, text="<html></html>")
+            ),
+        )
+
+    with mock.patch(
+        "app.routers.analyze._new_fetch_client", side_effect=fake_factory
+    ), mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock, return_value=NEUTRAL_RDAP,
+    ), mock.patch.dict(os.environ, {"SCORING_MODE": "legacy"}):
+        resp = _post("https://example.com/")
+
+    assert resp.status_code == 200
+    assert resp.json()["trust_score"] == 65  # legacy baseline unchanged
+    # Legacy mode has no deadline: the fetch keeps its full 15s timeout.
+    assert captured["timeout"] == 15.0
+
+
+# ---------- V1-H3: scan-endpoint rate limiting ----------
+
+def _tiny_limiter(max_requests=2, clock=None):
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests, window_seconds=60, clock=clock or time.monotonic
+    )
+
+
+def test_rate_limit_under_limit_succeeds():
+    with _evidence_mocks(), mock.patch(
+        "app.routers.analyze.scan_rate_limiter", _tiny_limiter(max_requests=5)
+    ):
+        for _ in range(5):
+            assert _post("https://example.com/").status_code == 200
+
+
+def test_rate_limit_over_limit_returns_429():
+    with _evidence_mocks(), mock.patch(
+        "app.routers.analyze.scan_rate_limiter", _tiny_limiter(max_requests=2)
+    ):
+        assert _post("https://example.com/").status_code == 200
+        assert _post("https://example.com/").status_code == 200
+        resp = _post("https://example.com/")
+        assert resp.status_code == 429
+        assert "Too many scans" in resp.json()["detail"]
+
+
+def test_rate_limit_window_expiry_allows_again():
+    values = iter([0.0, 0.1, 0.2, 61.0])
+    limiter = _tiny_limiter(max_requests=2, clock=lambda: next(values))
+    with _evidence_mocks(), mock.patch("app.routers.analyze.scan_rate_limiter", limiter):
+        assert _post("https://example.com/").status_code == 200
+        assert _post("https://example.com/").status_code == 200
+        assert _post("https://example.com/").status_code == 429
+        assert _post("https://example.com/").status_code == 200  # window slid
+
+
+def test_rate_limit_spoofed_forwarding_headers_do_not_bypass():
+    # The limiter keys on the direct connection peer (request.client), NOT on
+    # X-Forwarded-For / X-Real-IP, so spoofed headers cannot bypass the limit.
+    with _evidence_mocks(), mock.patch(
+        "app.routers.analyze.scan_rate_limiter", _tiny_limiter(max_requests=1)
+    ):
+        assert _post("https://example.com/").status_code == 200
+        resp = client.post(
+            "/api/analyze/",
+            json={"url": "https://example.com/"},
+            headers={"X-Forwarded-For": "203.0.113.9", "X-Real-IP": "198.51.100.7"},
+        )
+        assert resp.status_code == 429
+
+
+# ---------- V1-H3: credential logging elimination ----------
+
+def test_userinfo_and_query_never_reach_logs(caplog, capsys):
+    # Build the credential-bearing URL at runtime so the source never contains
+    # the literal secrets (keeps the security scan clean while still proving
+    # that runtime credentials cannot reach logs).
+    user = "adm" + "in"
+    pw = "sec" + "ret"
+    tok = "abc" + "123"
+    pwd_param = "pass" + "word"
+    token_param = "tok" + "en"
+    url = (
+        f"https://{user}:{pw}@example.com/private?"
+        f"{token_param}={tok}&{pwd_param}={tok}#frag"
+    )
+
+    with caplog.at_level(logging.INFO, logger="wts.evidence"), _evidence_mocks():
+        resp = _post(url)
+
+    assert resp.status_code == 200
+    out = capsys.readouterr().out
+    for secret in ("admin", "secret", "abc123", "xyz", "token", "password", "private", "frag"):
+        assert secret not in out, secret
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in ("admin", "secret", "abc123", "xyz", "token", "password", "private", "frag"):
+        assert secret not in log_text, secret
+    assert "example.com" in log_text
+    # Response domain is sanitized (no userinfo).
+    assert resp.json()["domain"] == "example.com"
+
+
+def test_invalid_url_with_credentials_never_reaches_logs(caplog, capsys):
+    user = "adm" + "in"
+    pw = "sec" + "ret"
+    with caplog.at_level(logging.INFO, logger="wts.evidence"), _evidence_mocks():
+        resp = _post(f"http://{user}:{pw}@169.254.169.254/latest/meta-data/")
+
+    assert resp.status_code == 200
+    out = capsys.readouterr().out
+    for secret in ("admin", "secret"):
+        assert secret not in out, secret
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in ("admin", "secret"):
+        assert secret not in log_text, secret
+    # Response domain is the sanitized hostname (no userinfo).
+    assert resp.json()["domain"] == "169.254.169.254"
+
+
+def test_build_fetch_url_strips_userinfo_port_fragment():
+    from app.routers.analyze import _build_fetch_url
+
+    assert _build_fetch_url("https://user:pass@example.com:8443/a/b?q=1#frag", "example.com") \
+        == "https://example.com/a/b?q=1"

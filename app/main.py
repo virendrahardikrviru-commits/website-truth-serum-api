@@ -50,3 +50,7 @@ from app.routers import analyze
 from app.routers import domain_intel  # 👈 NEW
 app.include_router(analyze.router)
 app.include_router(domain_intel.router)  # 👈 NEW
+
+# Fail fast on an invalid SCORING_MODE at startup (fail-closed, never silently
+# falls back to legacy). Evidence is the default; legacy is explicit rollback.
+analyze.get_scoring_mode()

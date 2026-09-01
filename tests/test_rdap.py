@@ -206,6 +206,19 @@ def test_rdap_network_failure():
     assert any("unreachable" in note for note in result["notes"])
 
 
+def test_rdap_redirect_is_not_followed():
+    # A redirecting RDAP server must be treated as unavailable, never followed
+    # (V1-H3: unguarded redirects are disabled).
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RDAP_BOOTSTRAP_URL):
+            return httpx.Response(200, json=SAMPLE_BOOTSTRAP)
+        return httpx.Response(302, headers={"location": "https://internal.example/evil"})
+
+    result = run_lookup(handler, "example.com")
+    assert result["source"] == "rdap_unavailable"
+    assert any("HTTP 302" in note for note in result["notes"])
+
+
 # ---------- RDAP malformed response ----------
 
 def test_rdap_malformed_response():

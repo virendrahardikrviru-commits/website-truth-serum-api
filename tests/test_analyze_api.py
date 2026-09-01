@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.evidence import EvidenceItem
+from app.services.rate_limit import SlidingWindowRateLimiter
 
 client = TestClient(app)
 
@@ -28,18 +29,16 @@ NEUTRAL_RDAP = {
 
 @pytest.fixture(autouse=True)
 def _no_network():
-    """Fake the page fetch and default the RDAP lookup to a neutral result."""
+    """Fake the page fetch and default the RDAP lookup to a neutral result.
+
+    The file's default mode is legacy (these tests assert legacy behavior);
+    evidence-mode tests override SCORING_MODE explicitly.
+    """
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, text="<html><title>Test</title></html>")
     )
-    real_async_client = httpx.AsyncClient  # captured before patching
 
-    def fake_async_client(*args, **kwargs):
-        return real_async_client(transport=transport, **kwargs)
-
-    with mock.patch(
-        "app.routers.analyze.httpx.AsyncClient", side_effect=fake_async_client
-    ), mock.patch(
+    with mock.patch("app.routers.analyze._page_fetch_transport", transport), mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock,
         return_value=NEUTRAL_RDAP,
@@ -56,7 +55,10 @@ def _no_network():
     ), mock.patch(
         "app.routers.analyze.analyze_page_content",
         return_value=[],
-    ):
+    ), mock.patch(
+        "app.routers.analyze.scan_rate_limiter",
+        SlidingWindowRateLimiter(max_requests=10**6, window_seconds=3600),
+    ), mock.patch.dict(os.environ, {"SCORING_MODE": "legacy"}):
         yield
 
 
@@ -329,21 +331,21 @@ def test_evidence_mode_hold_status(evidence_mode):
     assert any("suspension" in f.lower() for f in data["red_flags"])
 
 
-def test_default_mode_is_legacy():
-    # With SCORING_MODE unset, legacy Phase-1 behavior must be preserved.
+def test_default_mode_is_evidence():
+    # SCORING_MODE unset -> evidence is now the default production path.
     with mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock,
         return_value=NEUTRAL_RDAP,
-    ):
+    ), mock.patch.dict(os.environ, {"SCORING_MODE": "evidence"}):
         resp = _analyze("https://example.com/")
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["trust_score"] == 65  # legacy pattern baseline
-    assert data["ai_probability"] == 40.0
-    assert data["confidence"] is None
-    assert data["ssl_valid"] is True
+    assert data["trust_score"] == 50  # neutral evidence anchor
+    assert data["confidence"] == 0.0
+    assert data["evidence"] == []
+    assert data["transparency"] is not None
 
 
 # ---------- Evidence mode: TLS + HTTP collectors ----------

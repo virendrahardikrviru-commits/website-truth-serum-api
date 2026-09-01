@@ -45,6 +45,9 @@ def _patch_tls(monkeypatch, wrap_error=None, connect_error=None):
     else:
         ctx.wrap_socket.return_value = FakeTLS()
     monkeypatch.setattr(
+        "app.services.collectors.ssl.resolve_and_pin", lambda host, port: "1.1.1.1"
+    )
+    monkeypatch.setattr(
         "app.services.collectors.ssl.socket.create_connection", fake_connect
     )
     monkeypatch.setattr(
@@ -93,6 +96,73 @@ def test_tls_network_failure_unavailable_no_penalty(monkeypatch):
     _patch_tls(monkeypatch, connect_error=ConnectionRefusedError("refused"))
     items = asyncio.run(collect_tls("example.com"))
     assert items == []
+
+
+# ---------- V1-H3: TLS SSRF / pinning ----------
+
+def test_tls_non_public_resolution_rejected_neutral(monkeypatch):
+    from app.services.network_security import NonPublicDestinationError
+
+    monkeypatch.setattr(
+        "app.services.collectors.ssl.resolve_and_pin",
+        lambda host, port: (_ for _ in ()).throw(
+            NonPublicDestinationError(host, reason="private_ip_rejected")
+        ),
+    )
+    outcomes = {}
+    items = asyncio.run(collect_tls("evil.example", outcomes=outcomes))
+    assert items == []  # SSRF rejection -> unavailable/neutral, never a penalty
+    assert outcomes.get("tls") == "private_ip_rejected"
+
+
+def test_tls_dns_failure_rejected_neutral(monkeypatch):
+    from app.services.network_security import NonPublicDestinationError
+
+    monkeypatch.setattr(
+        "app.services.collectors.ssl.resolve_and_pin",
+        lambda host, port: (_ for _ in ()).throw(
+            NonPublicDestinationError(host, reason="dns_failed")
+        ),
+    )
+    outcomes = {}
+    items = asyncio.run(collect_tls("doesnotexist.example", outcomes=outcomes))
+    assert items == []
+    assert outcomes.get("tls") == "dns_failed"
+
+
+def test_tls_connects_to_validated_ip_with_sni(monkeypatch):
+    # The socket destination must be the validated IP; the hostname is kept
+    # only for SNI / certificate verification (server_hostname).
+    import ssl as _ssl
+
+    calls = {}
+
+    class FakeConn2:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_connect(addr, timeout):
+        calls["addr"] = addr
+        return FakeConn2()
+
+    ctx = mock.Mock()
+    ctx.wrap_socket.return_value = FakeTLS()
+    monkeypatch.setattr(
+        "app.services.collectors.ssl.resolve_and_pin", lambda host, port: "1.1.1.1"
+    )
+    monkeypatch.setattr("app.services.collectors.ssl.socket.create_connection", fake_connect)
+    monkeypatch.setattr(
+        "app.services.collectors.ssl.ssl.create_default_context", lambda: ctx
+    )
+
+    items = asyncio.run(collect_tls("example.com"))
+    assert calls["addr"] == ("1.1.1.1", 443)  # pinned validated IP is the target
+    assert len(items) == 1 and items[0].signal == "ssl_valid"
+    # SNI / cert verification still uses the logical hostname.
+    assert ctx.wrap_socket.call_args.kwargs.get("server_hostname") == "example.com"
 
 
 # ---------- HTTP behavior collector ----------

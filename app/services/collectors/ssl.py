@@ -22,6 +22,7 @@ import ssl
 from typing import Any, Dict, List, Optional
 
 from app.models.evidence import EvidenceItem
+from app.services.network_security import NonPublicDestinationError, resolve_and_pin
 
 TLS_TIMEOUT = 8.0
 TLS_PORT = 443
@@ -34,16 +35,25 @@ _TLS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 
 
 def _tls_handshake(domain: str, context: ssl.SSLContext):
-    with socket.create_connection((domain, TLS_PORT), timeout=TLS_TIMEOUT) as sock:
+    # Resolve once, validate fail-closed, and connect to the pinned public IP.
+    # The hostname is preserved for SNI / certificate verification; it is never
+    # re-resolved by the connect path (closes DNS-rebinding TOCTOU).
+    ip = resolve_and_pin(domain, TLS_PORT)
+    with socket.create_connection((ip, TLS_PORT), timeout=TLS_TIMEOUT) as sock:
         return context.wrap_socket(sock, server_hostname=domain)
 
 
-def _collect_tls_sync(domain: str) -> List[EvidenceItem]:
+def _collect_tls_sync(domain: str, outcomes: Optional[Dict[str, str]] = None) -> List[EvidenceItem]:
     try:
         context = ssl.create_default_context()  # verifies against system CAs
         with _tls_handshake(domain, context) as tls:
             version = tls.version()
             cert = tls.getpeercert()
+    except NonPublicDestinationError as exc:
+        # SSRF/DNS boundary rejection: unavailable/neutral, never a penalty.
+        if outcomes is not None:
+            outcomes["tls"] = exc.reason
+        return []
     except ssl.SSLCertVerificationError as exc:
         return [
             EvidenceItem(
@@ -95,11 +105,17 @@ def _collect_tls_sync(domain: str) -> List[EvidenceItem]:
     ]
 
 
-async def collect_tls(domain: str) -> List[EvidenceItem]:
+async def collect_tls(
+    domain: str, outcomes: Optional[Dict[str, str]] = None
+) -> List[EvidenceItem]:
     """Collect TLS evidence for a hostname. Never raises.
 
     The blocking handshake runs on a bounded worker pool so the event loop is
-    never blocked and concurrent scans cannot exhaust the executor.
+    never blocked and concurrent scans cannot exhaust the executor. When the
+    destination is rejected by the network security policy, ``[]`` is returned
+    (unavailable/neutral) and ``outcomes["tls"]`` records the boundary reason.
     """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_TLS_EXECUTOR, _collect_tls_sync, domain)
+    return await loop.run_in_executor(
+        _TLS_EXECUTOR, _collect_tls_sync, domain, outcomes
+    )

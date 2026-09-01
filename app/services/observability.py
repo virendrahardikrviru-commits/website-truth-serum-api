@@ -39,7 +39,8 @@ def log_collector(
     """Log the outcome of one evidence collector.
 
     ``outcome`` is one of: success, unavailable, timeout, rate_limited,
-    unauthorized, invalid, error, disabled.
+    unauthorized, invalid, error, disabled, ssrf_rejected, dns_failed,
+    private_ip_rejected, redirect_rejected.
     """
     _emit(
         scan_id,

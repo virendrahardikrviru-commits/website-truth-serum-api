@@ -1,7 +1,11 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-httpx
+# Pinned: the DNS-SSRF pinning transport (app/services/network_security.py)
+# depends on internal httpx/httpcore APIs. An unpinned upgrade could silently
+# re-open the SSRF boundary, so these versions are locked.
+httpx==0.25.1
+httpcore==1.0.9
 beautifulsoup4
 pydantic
 pydantic-settings
