@@ -9,6 +9,7 @@ import re
 
 from app.models.evidence import EvidenceItem
 from app.services.collectors.http_behavior import collect_http
+from app.services.collectors.security_headers import collect_security_headers
 from app.services.collectors.ssl import collect_tls
 from app.services.evidence import (
     evaluate_rdap_evidence,
@@ -204,6 +205,10 @@ async def analyze_website(
                 pass  # a collector must never break the analysis
             try:
                 items = items + await collect_http(str(request.url))
+            except Exception:
+                pass
+            try:
+                items = items + await collect_security_headers(str(request.url))
             except Exception:
                 pass
         result = evaluate_evidence(items)

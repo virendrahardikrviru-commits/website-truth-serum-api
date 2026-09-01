@@ -50,6 +50,10 @@ def _no_network():
         "app.routers.analyze.collect_http",
         new_callable=mock.AsyncMock,
         return_value=[],
+    ), mock.patch(
+        "app.routers.analyze.collect_security_headers",
+        new_callable=mock.AsyncMock,
+        return_value=[],
     ):
         yield
 
@@ -445,6 +449,10 @@ def test_evidence_mode_collectors_never_crash_analyze(evidence_mode):
         "app.routers.analyze.collect_http",
         new_callable=mock.AsyncMock,
         side_effect=RuntimeError("http boom"),
+    ), mock.patch(
+        "app.routers.analyze.collect_security_headers",
+        new_callable=mock.AsyncMock,
+        side_effect=RuntimeError("headers boom"),
     ):
         resp = _analyze()
 
@@ -453,3 +461,32 @@ def test_evidence_mode_collectors_never_crash_analyze(evidence_mode):
     assert data["trust_score"] == 50  # collectors unavailable -> neutral
     assert data["confidence"] == 0.0
     assert data["evidence"] == []
+
+
+def test_evidence_mode_security_headers(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.collect_security_headers",
+        new_callable=mock.AsyncMock,
+        return_value=[
+            EvidenceItem(
+                id="HDR_HSTS", category="security_headers", signal="hsts",
+                value="max-age=31536000", effect=1.0, confidence=1.0,
+                source="security_headers",
+                explanation="Strict-Transport-Security is enabled with a long max-age.",
+            ),
+            EvidenceItem(
+                id="HDR_CSP", category="security_headers", signal="csp",
+                value="default-src 'self'", effect=1.0, confidence=1.0,
+                source="security_headers",
+                explanation="Content-Security-Policy is present.",
+            ),
+        ],
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 52  # 50 + 2 (headers)
+    assert data["category_contributions"]["security_headers"] == 2.0
+    signals = {e["signal"] for e in data["evidence"]}
+    assert {"hsts", "csp"} <= signals

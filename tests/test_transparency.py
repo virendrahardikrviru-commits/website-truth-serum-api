@@ -67,6 +67,10 @@ def _no_network():
         "app.routers.analyze.collect_http",
         new_callable=mock.AsyncMock,
         return_value=[],
+    ), mock.patch(
+        "app.routers.analyze.collect_security_headers",
+        new_callable=mock.AsyncMock,
+        return_value=[],
     ):
         yield
 
@@ -89,7 +93,7 @@ def _http_item():
     )
 
 
-def _analyze(rdap=NEUTRAL_RDAP, tls=None, http=None, url="https://example.com/"):
+def _analyze(rdap=NEUTRAL_RDAP, tls=None, http=None, headers=None, url="https://example.com/"):
     with mock.patch.dict(os.environ, {"SCORING_MODE": "evidence"}), mock.patch(
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock,
@@ -102,6 +106,10 @@ def _analyze(rdap=NEUTRAL_RDAP, tls=None, http=None, url="https://example.com/")
         "app.routers.analyze.collect_http",
         new_callable=mock.AsyncMock,
         return_value=http if http is not None else [],
+    ), mock.patch(
+        "app.routers.analyze.collect_security_headers",
+        new_callable=mock.AsyncMock,
+        return_value=headers if headers is not None else [],
     ):
         return client.post("/api/analyze/", json={"url": url})
 

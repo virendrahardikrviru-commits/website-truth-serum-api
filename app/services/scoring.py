@@ -33,12 +33,13 @@ CATEGORY_CAPS: Dict[str, float] = {
     "domain": 10.0,
     "ssl": 10.0,
     "http": 5.0,
+    "security_headers": 5.0,
 }
 
 # The full planned evidence surface. Used as the confidence denominator so
 # that measuring only one dimension never produces high confidence.
 PLANNED_CATEGORIES: tuple = (
-    "domain", "ssl", "http", "headers", "content", "legal",
+    "domain", "ssl", "http", "security_headers", "content", "legal",
     "contact", "intel", "tech", "performance", "reputation",
 )
 
