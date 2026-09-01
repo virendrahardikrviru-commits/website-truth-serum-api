@@ -8,6 +8,7 @@ import asyncio
 import re
 
 from app.models.evidence import EvidenceItem
+from app.services.collectors.content import analyze_page_content
 from app.services.collectors.http_behavior import collect_http
 from app.services.collectors.security_headers import collect_security_headers
 from app.services.collectors.ssl import collect_tls
@@ -209,6 +210,10 @@ async def analyze_website(
                 pass
             try:
                 items = items + await collect_security_headers(str(request.url))
+            except Exception:
+                pass
+            try:
+                items = items + analyze_page_content(html)
             except Exception:
                 pass
         result = evaluate_evidence(items)

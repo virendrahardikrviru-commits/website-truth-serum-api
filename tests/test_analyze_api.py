@@ -32,9 +32,10 @@ def _no_network():
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, text="<html><title>Test</title></html>")
     )
+    real_async_client = httpx.AsyncClient  # captured before patching
 
     def fake_async_client(*args, **kwargs):
-        return httpx.AsyncClient(transport=transport, **kwargs)
+        return real_async_client(transport=transport, **kwargs)
 
     with mock.patch(
         "app.routers.analyze.httpx.AsyncClient", side_effect=fake_async_client
@@ -53,6 +54,9 @@ def _no_network():
     ), mock.patch(
         "app.routers.analyze.collect_security_headers",
         new_callable=mock.AsyncMock,
+        return_value=[],
+    ), mock.patch(
+        "app.routers.analyze.analyze_page_content",
         return_value=[],
     ):
         yield
@@ -490,3 +494,26 @@ def test_evidence_mode_security_headers(evidence_mode):
     assert data["category_contributions"]["security_headers"] == 2.0
     signals = {e["signal"] for e in data["evidence"]}
     assert {"hsts", "csp"} <= signals
+
+
+def test_evidence_mode_content(evidence_mode):
+    content_item = EvidenceItem(
+        id="CONTENT_TITLE", category="content", signal="title_present",
+        value="Example", effect=1.0, confidence=1.0, source="content",
+        explanation="The page includes a <title> element.",
+    )
+    with mock.patch(
+        "app.routers.analyze.analyze_page_content",
+        return_value=[content_item],
+    ) as content_mock:
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 51  # 50 + 1 (content)
+    assert data["category_contributions"]["content"] == 1.0
+    assert any(e["signal"] == "title_present" for e in data["evidence"])
+    # The pure collector received the HTML fetched by the endpoint.
+    assert content_mock.call_count == 1
+    html_arg = content_mock.call_args.args[0]
+    assert isinstance(html_arg, str) and "<html>" in html_arg

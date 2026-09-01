@@ -49,9 +49,10 @@ def _no_network():
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, text="<html><title>Test</title></html>")
     )
+    real_async_client = httpx.AsyncClient  # captured before patching
 
     def fake_async_client(*args, **kwargs):
-        return httpx.AsyncClient(transport=transport, **kwargs)
+        return real_async_client(transport=transport, **kwargs)
 
     with mock.patch(
         "app.routers.analyze.httpx.AsyncClient", side_effect=fake_async_client
@@ -70,6 +71,9 @@ def _no_network():
     ), mock.patch(
         "app.routers.analyze.collect_security_headers",
         new_callable=mock.AsyncMock,
+        return_value=[],
+    ), mock.patch(
+        "app.routers.analyze.analyze_page_content",
         return_value=[],
     ):
         yield
