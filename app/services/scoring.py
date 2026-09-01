@@ -109,7 +109,13 @@ def evaluate_evidence(items: List[EvidenceItem]) -> ScoreResult:
             elif effect < 0:
                 negative.append(item.explanation or f"{item.category}:{item.signal}")
 
+        raw_category_delta = category_delta
         category_delta = max(-cap, min(cap, category_delta))
+        if category_delta != raw_category_delta:
+            notes.append(
+                f"Category '{category}' hit its influence cap; "
+                f"net effect capped at {cap:g}."
+            )
         contributions[category] = round(category_delta, 2)
         total_delta += category_delta
 

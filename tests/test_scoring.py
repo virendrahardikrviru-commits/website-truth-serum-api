@@ -111,6 +111,63 @@ def test_http_category_cap():
     assert result.score == 55.0
 
 
+# ---------- Transparency invariants ----------
+
+def test_score_reconciles_with_category_contributions():
+    items = [
+        EvidenceItem(id="RDAP_001", category="domain", signal="domain_age",
+                     effect=5.0, confidence=1.0, source="rdap"),
+        EvidenceItem(id="TLS_001", category="ssl", signal="ssl_valid",
+                     effect=8.0, confidence=1.0, source="tls"),
+        EvidenceItem(id="HTTP_HTTPS", category="http", signal="https_ok",
+                     effect=2.0, confidence=1.0, source="http"),
+    ]
+    result = evaluate_evidence(items)
+    assert result.score == round(BASE_SCORE + sum(result.category_contributions.values()), 2)
+
+
+def test_score_reconciles_under_caps():
+    items = [
+        EvidenceItem(id="A", category="ssl", signal="x", effect=8.0,
+                     confidence=1.0, source="tls"),
+        EvidenceItem(id="B", category="ssl", signal="y", effect=8.0,
+                     confidence=1.0, source="tls"),
+    ]
+    result = evaluate_evidence(items)
+    assert result.category_contributions["ssl"] == 10.0
+    assert result.score == round(BASE_SCORE + sum(result.category_contributions.values()), 2)
+
+
+def test_category_cap_adds_transparency_note():
+    items = [
+        EvidenceItem(id="A", category="ssl", signal="x", effect=8.0,
+                     confidence=1.0, source="tls"),
+        EvidenceItem(id="B", category="ssl", signal="y", effect=8.0,
+                     confidence=1.0, source="tls"),
+    ]
+    result = evaluate_evidence(items)
+    assert any("cap" in n and "ssl" in n for n in result.notes)
+
+
+def test_confidence_always_in_0_1_range():
+    scenarios = [
+        [],  # no evidence -> 0
+        [age_item(5.0, 4000)],  # single category
+        [
+            EvidenceItem(id="RDAP_001", category="domain", signal="domain_age",
+                         effect=5.0, confidence=1.0, source="rdap"),
+            EvidenceItem(id="TLS_001", category="ssl", signal="ssl_valid",
+                         effect=8.0, confidence=1.0, source="tls"),
+            EvidenceItem(id="HTTP_HTTPS", category="http", signal="https_ok",
+                         effect=2.0, confidence=1.0, source="http"),
+        ],
+    ]
+    for items in scenarios:
+        result = evaluate_evidence(items)
+        assert 0.0 <= result.confidence <= 1.0
+    assert evaluate_evidence([]).confidence == 0.0
+
+
 # ---------- RDAP age rules ----------
 
 def test_old_domain_is_55():
