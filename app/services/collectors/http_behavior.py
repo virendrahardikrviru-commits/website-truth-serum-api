@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.models.evidence import EvidenceItem
+from app.services.rdap import is_public_hostname
 
 HTTP_TIMEOUT = 8.0
 MAX_REDIRECTS = 5
@@ -25,6 +26,12 @@ MAX_REDIRECTS = 5
 _USER_AGENT = (
     "WebsiteTruthSerum/1.0 (http://websitetruthserum.com; info@websitetruthserum.com)"
 )
+
+
+async def _guard_redirect_targets(request: httpx.Request) -> None:
+    """SSRF guard: abort requests whose target host is not a public hostname."""
+    if not is_public_hostname(request.url.host):
+        raise ValueError(f"blocked non-public host: {request.url.host}")
 
 
 async def collect_http(
@@ -44,6 +51,7 @@ async def collect_http(
             timeout=HTTP_TIMEOUT,
             follow_redirects=True,
             max_redirects=MAX_REDIRECTS,
+            event_hooks={"request": [_guard_redirect_targets]},
         )
 
     try:

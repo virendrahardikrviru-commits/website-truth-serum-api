@@ -16,6 +16,7 @@ from typing import List, Optional
 import httpx
 
 from app.models.evidence import EvidenceItem
+from app.services.rdap import is_public_hostname
 
 HEADERS_TIMEOUT = 8.0
 MAX_REDIRECTS = 5
@@ -23,6 +24,12 @@ MAX_REDIRECTS = 5
 _USER_AGENT = (
     "WebsiteTruthSerum/1.0 (http://websitetruthserum.com; info@websitetruthserum.com)"
 )
+
+
+async def _guard_redirect_targets(request: httpx.Request) -> None:
+    """SSRF guard: abort requests whose target host is not a public hostname."""
+    if not is_public_hostname(request.url.host):
+        raise ValueError(f"blocked non-public host: {request.url.host}")
 
 # 180 days; HSTS below this is considered weak, not dangerous.
 HSTS_GOOD_MAX_AGE = 15552000
@@ -196,6 +203,7 @@ async def collect_security_headers(
             timeout=HEADERS_TIMEOUT,
             follow_redirects=True,
             max_redirects=MAX_REDIRECTS,
+            event_hooks={"request": [_guard_redirect_targets]},
         )
 
     try:

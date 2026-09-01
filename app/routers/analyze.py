@@ -18,8 +18,27 @@ from app.services.evidence import (
     format_domain_age,
     rdap_evidence_items,
 )
-from app.services.rdap import normalize_domain, rdap_lookup
+from app.services.rdap import is_public_hostname, normalize_domain, rdap_lookup
 from app.services.scoring import evaluate_evidence, summarize
+
+# Maximum page body bytes the analyzer will buffer (resource bound).
+MAX_PAGE_BYTES = 2_000_000
+
+
+def _cap_page_html(raw: Optional[str], max_bytes: int = MAX_PAGE_BYTES) -> Optional[str]:
+    """Truncate a fetched page body to a bounded size (safety net for bodies
+    served without a usable Content-Length header)."""
+    if raw is None:
+        return None
+    return raw[:max_bytes]
+
+
+async def _guard_public_redirects(request: httpx.Request) -> None:
+    """SSRF guard: abort any outbound request whose target host is not a
+    public hostname (blocks IP literals, loopback, link-local and single-label
+    targets, including redirect hops)."""
+    if not is_public_hostname(request.url.host):
+        raise ValueError(f"blocked non-public host: {request.url.host}")
 
 router = APIRouter(prefix="/api/analyze", tags=["analysis"])
 
@@ -139,36 +158,49 @@ async def analyze_website(
     # Add background task for logging (optional)
     background_tasks.add_task(log_scan, domain)
     
-    try:
-        # Fetch the website content
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            response = await client.get(
-                str(request.url),
-                headers={
-                    "User-Agent": "WebsiteTruthSerum/1.0 (http://websitetruthserum.com; info@websitetruthserum.com)"
-                }
-            )
-            html = response.text
-            
-            # Here you would add actual AI analysis using DeepSeek API
-            # For now, we'll use the mock data
-            
-    except httpx.TimeoutException:
-        # If fetch times out, use mock data
-        html = None
-    except Exception as e:
-        # Handle other errors
-        html = None
+    # Validate/normalize the domain before ANY network access (SSRF guard).
+    normalized = normalize_domain(domain)
+
+    # Fetch the website content only for public hostnames. Redirect targets are
+    # restricted to public hostnames too, and the body size is bounded.
+    html = None
+    if normalized is not None:
+        try:
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=True,
+                event_hooks={"request": [_guard_public_redirects]},
+            ) as client:
+                response = await client.get(
+                    str(request.url),
+                    headers={
+                        "User-Agent": "WebsiteTruthSerum/1.0 (http://websitetruthserum.com; info@websitetruthserum.com)"
+                    },
+                )
+                content_length = response.headers.get("content-length")
+                if (
+                    content_length
+                    and content_length.isdigit()
+                    and int(content_length) > MAX_PAGE_BYTES
+                ):
+                    # Abort oversized downloads before buffering them.
+                    html = None
+                else:
+                    html = _cap_page_html(response.text)
+        except httpx.TimeoutException:
+            # If fetch times out, use mock data
+            html = None
+        except Exception:
+            # Handle other errors (incl. blocked non-public redirect targets)
+            html = None
     
     # Analyze the domain (legacy pattern baseline, retained for rollback).
     analysis = analyze_domain(domain)
 
     # Fetch real RDAP intelligence (shared by both scoring modes, never fatal).
-    normalized = None
     rdap = None
     domain_intel = None
     try:
-        normalized = normalize_domain(domain)
         if normalized is not None:
             rdap = await rdap_lookup(normalized)
             domain_intel = {

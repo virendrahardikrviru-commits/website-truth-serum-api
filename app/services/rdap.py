@@ -57,6 +57,17 @@ def normalize_domain(raw: str) -> Optional[str]:
     return host
 
 
+def is_public_hostname(host: str) -> bool:
+    """True only for a valid, public-looking hostname.
+
+    Rejects IP literals (private, loopback, link-local or otherwise),
+    single-label names (e.g. ``localhost``) and anything that is not a
+    dot-separated hostname with a letter TLD. Used as an SSRF guard before any
+    outbound network request.
+    """
+    return normalize_domain(host) is not None
+
+
 def calculate_domain_age(iso_date: Optional[str]) -> Optional[int]:
     """Calculate domain age in whole days from an ISO date string."""
     if not iso_date:
