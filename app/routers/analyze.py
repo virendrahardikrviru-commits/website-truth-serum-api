@@ -7,8 +7,14 @@ import os
 import asyncio
 import re
 
-from app.services.evidence import evaluate_rdap_evidence, format_domain_age
+from app.models.evidence import EvidenceItem
+from app.services.evidence import (
+    evaluate_rdap_evidence,
+    format_domain_age,
+    rdap_evidence_items,
+)
 from app.services.rdap import normalize_domain, rdap_lookup
+from app.services.scoring import evaluate_evidence, summarize
 
 router = APIRouter(prefix="/api/analyze", tags=["analysis"])
 
@@ -20,7 +26,7 @@ class AnalyzeResponse(BaseModel):
     url: str
     trust_score: float
     category: str
-    ai_probability: float
+    ai_probability: Optional[float] = None
     red_flags: List[str]
     green_flags: List[str]
     summary: str
@@ -29,6 +35,11 @@ class AnalyzeResponse(BaseModel):
     domain_age: Optional[str] = None
     ssl_valid: Optional[bool] = None
     domain_intel: Optional[Dict[str, Any]] = None
+    confidence: Optional[float] = None
+    risk_level: Optional[str] = None
+    evidence: Optional[List[EvidenceItem]] = None
+    category_contributions: Optional[Dict[str, float]] = None
+    notes: Optional[List[str]] = None
 
 # ============================================
 # Mock Data (Replace with real API calls)
@@ -144,19 +155,11 @@ async def analyze_website(
         # Handle other errors
         html = None
     
-    # Analyze the domain
+    # Analyze the domain (legacy pattern baseline, retained for rollback).
     analysis = analyze_domain(domain)
-    
-    # Calculate trust score (0-100)
-    trust_score = analysis["score"]
-    ai_probability = analysis["ai"]
-    category = analysis["category"]
-    red_flags = analysis["red_flags"]
-    green_flags = analysis["green_flags"]
-    summary = analysis["summary"]
-    domain_age = analysis.get("domain_age", "Unknown")
 
-    # Integrate real RDAP intelligence (additive, conservative, never fatal).
+    # Fetch real RDAP intelligence (shared by both scoring modes, never fatal).
+    rdap = None
     domain_intel = None
     try:
         normalized = normalize_domain(domain)
@@ -174,17 +177,63 @@ async def analyze_website(
                 "source": rdap.get("source", "rdap_unavailable"),
                 "notes": rdap.get("notes") or None,
             }
+    except Exception:
+        # RDAP must never break the analysis.
+        rdap = None
+        domain_intel = None
+
+    real_age_days = None
+    if rdap is not None:
+        age_days = rdap.get("domain_age_days")
+        if isinstance(age_days, int) and age_days >= 0:
+            real_age_days = age_days
+
+    # Select the scoring path. Default is 'legacy' for safe rollback; set
+    # SCORING_MODE=evidence to enable the deterministic evidence engine.
+    scoring_mode = os.getenv("SCORING_MODE", "legacy").lower()
+
+    if scoring_mode == "evidence":
+        items = rdap_evidence_items(rdap) if rdap is not None else []
+        result = evaluate_evidence(items)
+        trust_score = result.score
+        confidence = result.confidence
+        risk_level = result.risk_level
+        category = result.category
+        ai_probability = None  # not measured in Phase 2a
+        red_flags = list(result.negative_signals)
+        green_flags = list(result.positive_signals)
+        notes = list(result.notes)
+        ssl_valid = None  # not measured in Phase 2a
+        applied_evidence = result.applied_evidence
+        category_contributions = result.category_contributions
+        domain_age = (
+            format_domain_age(real_age_days) if real_age_days is not None else "Unknown"
+        )
+        summary = summarize(result)
+    else:
+        # Legacy path: Phase 1 behavior unchanged (pattern baseline + bounded
+        # RDAP signal), isolated from the evidence engine.
+        trust_score = analysis["score"]
+        ai_probability = analysis["ai"]
+        category = analysis["category"]
+        red_flags = list(analysis["red_flags"])
+        green_flags = list(analysis["green_flags"])
+        summary = analysis["summary"]
+        domain_age = analysis.get("domain_age", "Unknown")
+        ssl_valid = analysis.get("ssl_valid", None)
+        confidence = None
+        risk_level = None
+        notes = None
+        applied_evidence = None
+        category_contributions = None
+        if rdap is not None:
             evidence = evaluate_rdap_evidence(rdap)
             trust_score = max(0.0, min(100.0, trust_score + evidence["score_delta"]))
             red_flags = red_flags + evidence["red_flags"]
             green_flags = green_flags + evidence["green_flags"]
-            age_days = rdap.get("domain_age_days")
-            if isinstance(age_days, int) and age_days >= 0:
-                domain_age = format_domain_age(age_days)
-    except Exception:
-        # RDAP must never break the analysis; fall back to existing behavior.
-        domain_intel = None
-    
+            if real_age_days is not None:
+                domain_age = format_domain_age(real_age_days)
+
     return AnalyzeResponse(
         url=str(request.url),
         trust_score=trust_score,
@@ -196,8 +245,13 @@ async def analyze_website(
         analyzed_at=datetime.now(),
         domain=domain,
         domain_age=domain_age,
-        ssl_valid=analysis.get("ssl_valid", None),
-        domain_intel=domain_intel
+        ssl_valid=ssl_valid,
+        domain_intel=domain_intel,
+        confidence=confidence,
+        risk_level=risk_level,
+        evidence=applied_evidence,
+        category_contributions=category_contributions,
+        notes=notes,
     )
 
 @router.get("/test")

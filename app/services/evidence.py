@@ -15,6 +15,8 @@ existing analyzer.
 
 from typing import Any, Dict, List
 
+from app.models.evidence import EvidenceItem
+
 MAX_SCORE_DELTA = 10
 
 # Registry/registrar states indicating the domain is not in normal operation.
@@ -87,3 +89,62 @@ def format_domain_age(days: int) -> str:
     if months:
         base += f", {months} month{'s' if months != 1 else ''}"
     return base
+
+
+def rdap_evidence_items(rdap: Dict[str, Any]) -> List[EvidenceItem]:
+    """Convert a normalized RDAP result into EvidenceItems (Phase 2a).
+
+    Only real observations produce items:
+
+    - ``domain_age`` item when a valid age is present (+5 / -5 / 0).
+    - ``domain_status`` item only when a hold/suspension state is present (-5).
+
+    Missing age, missing status and ``source != rdap`` produce no items, so
+    the engine scores them as neutral. Multiple hold statuses emit a single
+    -5 item (they do not stack).
+    """
+    items: List[EvidenceItem] = []
+    if not rdap or rdap.get("source") != "rdap":
+        return items
+
+    age_days = rdap.get("domain_age_days")
+    if isinstance(age_days, int) and age_days >= 0:
+        if age_days >= OLD_DOMAIN_DAYS:
+            effect = 5.0
+        elif age_days < YOUNG_DOMAIN_DAYS:
+            effect = -5.0
+        else:
+            effect = 0.0
+        items.append(
+            EvidenceItem(
+                id="RDAP_001",
+                category="domain",
+                signal="domain_age",
+                value=age_days,
+                effect=effect,
+                confidence=1.0,
+                source="rdap",
+                explanation=f"Domain age is {format_domain_age(age_days)}.",
+            )
+        )
+
+    status = [str(s).lower() for s in (rdap.get("status") or [])]
+    hold_states = sorted(s for s in status if s in HOLD_STATUSES)
+    if hold_states:
+        items.append(
+            EvidenceItem(
+                id="RDAP_002",
+                category="domain",
+                signal="domain_status",
+                value=hold_states,
+                effect=-5.0,
+                confidence=1.0,
+                source="rdap",
+                explanation=(
+                    "Domain is in a registry/registrar suspension state "
+                    f"({', '.join(hold_states)})."
+                ),
+            )
+        )
+
+    return items

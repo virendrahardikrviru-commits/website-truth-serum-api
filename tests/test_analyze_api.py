@@ -1,4 +1,5 @@
 from datetime import date
+import os
 from unittest import mock
 
 import httpx
@@ -218,3 +219,113 @@ def test_analyze_trusted_domain_existing_behavior():
 def test_analyze_invalid_url_rejected():
     resp = client.post("/api/analyze/", json={"url": "not-a-url"})
     assert resp.status_code == 422
+
+
+# ---------- Evidence mode (SCORING_MODE=evidence) ----------
+
+@pytest.fixture()
+def evidence_mode():
+    with mock.patch.dict(os.environ, {"SCORING_MODE": "evidence"}):
+        yield
+
+
+def test_evidence_mode_old_domain_not_100(evidence_mode):
+    # github.com with only RDAP old-age evidence must NOT reach 100.
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=6902, status=["ok"]),
+    ):
+        resp = _analyze("https://github.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 55
+    assert data["category"] == "moderate"
+    assert data["domain_age"] == "18 years, 11 months"
+    assert data["ai_probability"] is None
+    assert data["ssl_valid"] is None
+    assert data["confidence"] == 0.41
+    assert data["domain_intel"]["source"] == "rdap"
+    assert len(data["evidence"]) == 1
+    assert data["evidence"][0]["signal"] == "domain_age"
+
+
+def test_evidence_mode_young_domain(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=10, status=["ok"]),
+    ):
+        resp = _analyze("https://newtest.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 45
+    assert data["category"] == "untrustworthy"
+    assert data["risk_level"] == "elevated"
+    assert data["red_flags"] == ["Domain age is 10 days."]
+    assert data["domain_age"] == "10 days"
+
+
+def test_evidence_mode_rdap_unavailable_neutral(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=NEUTRAL_RDAP,
+    ):
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 50
+    assert data["confidence"] == 0.0
+    assert data["evidence"] == []
+    assert data["ai_probability"] is None
+    assert "Insufficient evidence" in data["summary"]
+
+
+def test_evidence_mode_rdap_failure_neutral(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        side_effect=RuntimeError("boom"),
+    ):
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 50
+    assert data["confidence"] == 0.0
+    assert data["domain_intel"] is None
+
+
+def test_evidence_mode_hold_status(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=500, status=["clientHold"]),
+    ):
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 45
+    assert any("suspension" in f.lower() for f in data["red_flags"])
+
+
+def test_default_mode_is_legacy():
+    # With SCORING_MODE unset, legacy Phase-1 behavior must be preserved.
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=NEUTRAL_RDAP,
+    ):
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 65  # legacy pattern baseline
+    assert data["ai_probability"] == 40.0
+    assert data["confidence"] is None
+    assert data["ssl_valid"] is True
