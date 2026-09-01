@@ -185,6 +185,17 @@ def _analyze_headers(headers) -> List[EvidenceItem]:
     return items
 
 
+def analyze_headers_response(response: Optional[httpx.Response]) -> List[EvidenceItem]:
+    """Derive security-header evidence from an already-fetched response.
+
+    Pure and deterministic; used by the evidence orchestrator to reuse the
+    single SSRF-validated page response instead of issuing a second GET.
+    """
+    if response is None:
+        return []
+    return _analyze_headers(response.headers)
+
+
 async def collect_security_headers(
     url: str,
     client: Optional[httpx.AsyncClient] = None,
@@ -219,4 +230,4 @@ async def collect_security_headers(
             except Exception:
                 pass
 
-    return _analyze_headers(response.headers)
+    return analyze_headers_response(response)

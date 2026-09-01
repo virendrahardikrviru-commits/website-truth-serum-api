@@ -34,6 +34,76 @@ async def _guard_redirect_targets(request: httpx.Request) -> None:
         raise ValueError(f"blocked non-public host: {request.url.host}")
 
 
+def analyze_http_response(
+    response: Optional[httpx.Response],
+    original_url: str,
+    redirect_loop: bool = False,
+) -> List[EvidenceItem]:
+    """Derive HTTP-behavior evidence from an already-fetched response.
+
+    Pure and deterministic; used by the evidence orchestrator to reuse the
+    single SSRF-validated page response instead of issuing a second GET.
+    ``redirect_loop`` records a TooManyRedirects outcome when no response
+    object was produced.
+    """
+    if redirect_loop:
+        return [
+            EvidenceItem(
+                id="HTTP_LOOP",
+                category="http",
+                signal="redirect_loop",
+                value=None,
+                effect=-3.0,
+                confidence=1.0,
+                source="http",
+                explanation="Excessive redirects or a redirect loop was detected.",
+            )
+        ]
+    if response is None:
+        return []
+
+    original_scheme = urlparse(original_url).scheme
+    final_url = str(response.url)
+    final_scheme = response.url.scheme
+    redirect_count = len(response.history)
+    status_code = response.status_code
+
+    facts = {
+        "final_url": final_url,
+        "status_code": status_code,
+        "redirect_count": redirect_count,
+    }
+
+    items: List[EvidenceItem] = []
+    if final_scheme == "https":
+        items.append(
+            EvidenceItem(
+                id="HTTP_HTTPS",
+                category="http",
+                signal="https_ok",
+                value=facts,
+                effect=2.0,
+                confidence=1.0,
+                source="http",
+                explanation="HTTPS endpoint responded successfully.",
+            )
+        )
+    if original_scheme == "http" and final_scheme == "https":
+        items.append(
+            EvidenceItem(
+                id="HTTP_UPGRADE",
+                category="http",
+                signal="http_to_https",
+                value=True,
+                effect=2.0,
+                confidence=1.0,
+                source="http",
+                explanation="Site redirects HTTP traffic to HTTPS.",
+            )
+        )
+    return items
+
+
 async def collect_http(
     url: str,
     client: Optional[httpx.AsyncClient] = None,
@@ -57,18 +127,7 @@ async def collect_http(
     try:
         response = await client.get(url, headers={"User-Agent": _USER_AGENT})
     except httpx.TooManyRedirects:
-        return [
-            EvidenceItem(
-                id="HTTP_LOOP",
-                category="http",
-                signal="redirect_loop",
-                value=None,
-                effect=-3.0,
-                confidence=1.0,
-                source="http",
-                explanation="Excessive redirects or a redirect loop was detected.",
-            )
-        ]
+        return analyze_http_response(None, url, redirect_loop=True)
     except httpx.TimeoutException:
         return items  # unavailable, no penalty
     except httpx.NetworkError:
@@ -82,44 +141,4 @@ async def collect_http(
             except Exception:
                 pass
 
-    original_scheme = urlparse(url).scheme
-    final_url = str(response.url)
-    final_scheme = response.url.scheme
-    redirect_count = len(response.history)
-    status_code = response.status_code
-
-    facts = {
-        "final_url": final_url,
-        "status_code": status_code,
-        "redirect_count": redirect_count,
-    }
-
-    if final_scheme == "https":
-        items.append(
-            EvidenceItem(
-                id="HTTP_HTTPS",
-                category="http",
-                signal="https_ok",
-                value=facts,
-                effect=2.0,
-                confidence=1.0,
-                source="http",
-                explanation="HTTPS endpoint responded successfully.",
-            )
-        )
-
-    if original_scheme == "http" and final_scheme == "https":
-        items.append(
-            EvidenceItem(
-                id="HTTP_UPGRADE",
-                category="http",
-                signal="http_to_https",
-                value=True,
-                effect=2.0,
-                confidence=1.0,
-                source="http",
-                explanation="Site redirects HTTP traffic to HTTPS.",
-            )
-        )
-
-    return items
+    return analyze_http_response(response, url)

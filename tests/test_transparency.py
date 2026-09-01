@@ -65,12 +65,10 @@ def _no_network():
         new_callable=mock.AsyncMock,
         return_value=[],
     ), mock.patch(
-        "app.routers.analyze.collect_http",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_http_response",
         return_value=[],
     ), mock.patch(
-        "app.routers.analyze.collect_security_headers",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_headers_response",
         return_value=[],
     ), mock.patch(
         "app.routers.analyze.analyze_page_content",
@@ -107,12 +105,10 @@ def _analyze(rdap=NEUTRAL_RDAP, tls=None, http=None, headers=None, url="https://
         new_callable=mock.AsyncMock,
         return_value=tls if tls is not None else [],
     ), mock.patch(
-        "app.routers.analyze.collect_http",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_http_response",
         return_value=http if http is not None else [],
     ), mock.patch(
-        "app.routers.analyze.collect_security_headers",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_headers_response",
         return_value=headers if headers is not None else [],
     ):
         return client.post("/api/analyze/", json={"url": url})

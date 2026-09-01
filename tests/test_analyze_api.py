@@ -48,12 +48,10 @@ def _no_network():
         new_callable=mock.AsyncMock,
         return_value=[],
     ), mock.patch(
-        "app.routers.analyze.collect_http",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_http_response",
         return_value=[],
     ), mock.patch(
-        "app.routers.analyze.collect_security_headers",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_headers_response",
         return_value=[],
     ), mock.patch(
         "app.routers.analyze.analyze_page_content",
@@ -408,8 +406,7 @@ def test_evidence_mode_tls_failure(evidence_mode):
 
 def test_evidence_mode_http_https(evidence_mode):
     with mock.patch(
-        "app.routers.analyze.collect_http",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_http_response",
         return_value=[_http_item(2.0)],
     ):
         resp = _analyze()
@@ -430,8 +427,7 @@ def test_evidence_mode_combined_rdap_tls_http(evidence_mode):
         new_callable=mock.AsyncMock,
         return_value=[_tls_item(6.0)],
     ), mock.patch(
-        "app.routers.analyze.collect_http",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_http_response",
         return_value=[_http_item(2.0)],
     ):
         resp = _analyze()
@@ -450,13 +446,14 @@ def test_evidence_mode_collectors_never_crash_analyze(evidence_mode):
         new_callable=mock.AsyncMock,
         side_effect=RuntimeError("tls boom"),
     ), mock.patch(
-        "app.routers.analyze.collect_http",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_http_response",
         side_effect=RuntimeError("http boom"),
     ), mock.patch(
-        "app.routers.analyze.collect_security_headers",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_headers_response",
         side_effect=RuntimeError("headers boom"),
+    ), mock.patch(
+        "app.routers.analyze.analyze_page_content",
+        side_effect=RuntimeError("content boom"),
     ):
         resp = _analyze()
 
@@ -469,8 +466,7 @@ def test_evidence_mode_collectors_never_crash_analyze(evidence_mode):
 
 def test_evidence_mode_security_headers(evidence_mode):
     with mock.patch(
-        "app.routers.analyze.collect_security_headers",
-        new_callable=mock.AsyncMock,
+        "app.routers.analyze.analyze_headers_response",
         return_value=[
             EvidenceItem(
                 id="HDR_HSTS", category="security_headers", signal="hsts",

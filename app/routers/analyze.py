@@ -5,13 +5,17 @@ import httpx
 from datetime import datetime
 import os
 import asyncio
+import logging
 import re
+import time
+import uuid
 
 from app.models.evidence import EvidenceItem
+from app.services import observability as obs
 from app.services.collectors.content import analyze_page_content
-from app.services.collectors.http_behavior import collect_http
+from app.services.collectors.http_behavior import analyze_http_response, collect_http
 from app.services.collectors.reputation import collect_reputation
-from app.services.collectors.security_headers import collect_security_headers
+from app.services.collectors.security_headers import analyze_headers_response, collect_security_headers
 from app.services.collectors.ssl import collect_tls
 from app.services.evidence import (
     evaluate_rdap_evidence,
@@ -23,6 +27,11 @@ from app.services.scoring import evaluate_evidence, summarize
 
 # Maximum page body bytes the analyzer will buffer (resource bound).
 MAX_PAGE_BYTES = 2_000_000
+
+# Evidence-mode-only overall scan deadline (wall-clock budget for the whole
+# evidence scan, including page fetch and RDAP). Unfinished collectors are
+# treated as unavailable/neutral when the deadline is reached.
+SCAN_DEADLINE_SECONDS = 22.0
 
 
 def _cap_page_html(raw: Optional[str], max_bytes: int = MAX_PAGE_BYTES) -> Optional[str]:
@@ -158,12 +167,23 @@ async def analyze_website(
     # Add background task for logging (optional)
     background_tasks.add_task(log_scan, domain)
     
+    # Select the scoring path. Default is 'legacy' for safe rollback; set
+    # SCORING_MODE=evidence to enable the deterministic evidence engine.
+    scoring_mode = os.getenv("SCORING_MODE", "legacy").lower()
+    scan_id = str(uuid.uuid4())
+    scan_started = time.monotonic()
+    deadline = scan_started + SCAN_DEADLINE_SECONDS if scoring_mode == "evidence" else None
+
     # Validate/normalize the domain before ANY network access (SSRF guard).
     normalized = normalize_domain(domain)
 
     # Fetch the website content only for public hostnames. Redirect targets are
-    # restricted to public hostnames too, and the body size is bounded.
+    # restricted to public hostnames too, and the body size is bounded. The
+    # response object is retained so evidence mode can derive HTTP-behavior and
+    # security-header evidence from this single request.
     html = None
+    page_response = None
+    page_redirect_loop = False
     if normalized is not None:
         try:
             async with httpx.AsyncClient(
@@ -171,13 +191,13 @@ async def analyze_website(
                 follow_redirects=True,
                 event_hooks={"request": [_guard_public_redirects]},
             ) as client:
-                response = await client.get(
+                page_response = await client.get(
                     str(request.url),
                     headers={
                         "User-Agent": "WebsiteTruthSerum/1.0 (http://websitetruthserum.com; info@websitetruthserum.com)"
                     },
                 )
-                content_length = response.headers.get("content-length")
+                content_length = page_response.headers.get("content-length")
                 if (
                     content_length
                     and content_length.isdigit()
@@ -186,7 +206,11 @@ async def analyze_website(
                     # Abort oversized downloads before buffering them.
                     html = None
                 else:
-                    html = _cap_page_html(response.text)
+                    html = _cap_page_html(page_response.text)
+        except httpx.TooManyRedirects:
+            # A redirect loop was detected; HTTP evidence records it.
+            page_redirect_loop = True
+            html = None
         except httpx.TimeoutException:
             # If fetch times out, use mock data
             html = None
@@ -226,34 +250,109 @@ async def analyze_website(
         if isinstance(age_days, int) and age_days >= 0:
             real_age_days = age_days
 
-    # Select the scoring path. Default is 'legacy' for safe rollback; set
-    # SCORING_MODE=evidence to enable the deterministic evidence engine.
-    scoring_mode = os.getenv("SCORING_MODE", "legacy").lower()
-
     if scoring_mode == "evidence":
         items = rdap_evidence_items(rdap) if rdap is not None else []
         if normalized is not None:
+            # Pure evidence derived from the single SSRF-validated page response.
+            def _log_sync(collector, started, produced, outcome=None):
+                duration_ms = (time.monotonic() - started) * 1000
+                obs.log_collector(
+                    scan_id, normalized, scoring_mode, collector, duration_ms,
+                    outcome or ("success" if produced else "unavailable"),
+                    len(produced) if produced else 0,
+                )
+
             try:
-                items = items + await collect_tls(normalized)
+                _started = time.monotonic()
+                http_items = analyze_http_response(
+                    page_response, str(request.url), redirect_loop=page_redirect_loop
+                )
+                items = items + http_items
+                _log_sync("http", _started, http_items)
             except Exception:
-                pass  # a collector must never break the analysis
-            try:
-                items = items + await collect_http(str(request.url))
-            except Exception:
-                pass
-            try:
-                items = items + await collect_security_headers(str(request.url))
-            except Exception:
-                pass
-            try:
-                items = items + analyze_page_content(html)
-            except Exception:
-                pass
-            if os.getenv("REPUTATION_ENABLED", "false").lower() == "true":
+                obs.log_collector(scan_id, normalized, scoring_mode, "http",
+                                  (time.monotonic() - _started) * 1000, "error", 0,
+                                  level=logging.ERROR)
+
+            if page_response is not None:
                 try:
-                    items = items + await collect_reputation(normalized)
+                    _started = time.monotonic()
+                    header_items = analyze_headers_response(page_response)
+                    items = items + header_items
+                    _log_sync("security_headers", _started, header_items)
                 except Exception:
-                    pass  # a collector must never break the analysis
+                    obs.log_collector(scan_id, normalized, scoring_mode,
+                                      "security_headers",
+                                      (time.monotonic() - _started) * 1000, "error", 0,
+                                      level=logging.ERROR)
+
+            try:
+                _started = time.monotonic()
+                content_items = analyze_page_content(html)
+                items = items + content_items
+                _log_sync("content", _started, content_items)
+            except Exception:
+                obs.log_collector(scan_id, normalized, scoring_mode, "content",
+                                  (time.monotonic() - _started) * 1000, "error", 0,
+                                  level=logging.ERROR)
+
+            # Async collectors run under the overall evidence deadline. When the
+            # deadline is reached, already-completed evidence is retained and
+            # unfinished collectors are cancelled (treated unavailable/neutral).
+            async def _task(coro):
+                try:
+                    return await coro
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return []
+
+            rep_outcomes: Dict[str, str] = {}
+            async_tasks = {}
+            task_starts = {}
+            async_tasks["tls"] = asyncio.ensure_future(_task(collect_tls(normalized)))
+            task_starts["tls"] = time.monotonic()
+            if os.getenv("REPUTATION_ENABLED", "false").lower() == "true":
+                async_tasks["reputation"] = asyncio.ensure_future(
+                    _task(collect_reputation(normalized, outcomes=rep_outcomes))
+                )
+                task_starts["reputation"] = time.monotonic()
+
+            remaining = max(0.0, deadline - time.monotonic()) if deadline else None
+            done, pending = await asyncio.wait(
+                list(async_tasks.values()),
+                timeout=remaining,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+
+            for name, task in async_tasks.items():
+                duration_ms = (time.monotonic() - task_starts[name]) * 1000
+                if task in done:
+                    try:
+                        result = task.result()
+                        obs.log_collector(
+                            scan_id, normalized, scoring_mode, name, duration_ms,
+                            "success" if result else "unavailable", len(result),
+                        )
+                        items = items + result
+                    except Exception:
+                        obs.log_collector(scan_id, normalized, scoring_mode, name,
+                                          duration_ms, "error", 0, level=logging.ERROR)
+                else:
+                    obs.log_collector(scan_id, normalized, scoring_mode, name,
+                                      duration_ms, "timeout", 0, level=logging.WARNING)
+
+            # Surface reputation provider configuration problems without
+            # affecting the score.
+            for provider in ("urlhaus", "spamhaus_dbl"):
+                outcome = rep_outcomes.get(provider)
+                if outcome in ("rate_limited", "unauthorized"):
+                    obs.log_collector(
+                        scan_id, normalized, scoring_mode, f"reputation:{provider}",
+                        (time.monotonic() - task_starts.get("reputation", scan_started)) * 1000,
+                        outcome, 0, level=logging.WARNING)
         result = evaluate_evidence(items)
         trust_score = result.score
         confidence = result.confidence
@@ -270,6 +369,12 @@ async def analyze_website(
             format_domain_age(real_age_days) if real_age_days is not None else "Unknown"
         )
         summary = summarize(result)
+        obs.log_scan_result(
+            scan_id, normalized or domain, scoring_mode,
+            (time.monotonic() - scan_started) * 1000,
+            result.score, result.category, result.confidence,
+            len(result.category_contributions),
+        )
     else:
         # Legacy path: Phase 1 behavior unchanged (pattern baseline + bounded
         # RDAP signal), isolated from the evidence engine.

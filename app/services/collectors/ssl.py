@@ -16,6 +16,7 @@ captured in the evidence ``value`` but are NOT scored.
 """
 
 import asyncio
+import concurrent.futures
 import socket
 import ssl
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,12 @@ from app.models.evidence import EvidenceItem
 
 TLS_TIMEOUT = 8.0
 TLS_PORT = 443
+
+# Bounded worker pool for the blocking TLS handshake so sustained concurrent
+# scans cannot exhaust the default executor or drift unbounded threads.
+_TLS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="wts-tls"
+)
 
 
 def _tls_handshake(domain: str, context: ssl.SSLContext):
@@ -89,5 +96,10 @@ def _collect_tls_sync(domain: str) -> List[EvidenceItem]:
 
 
 async def collect_tls(domain: str) -> List[EvidenceItem]:
-    """Collect TLS evidence for a hostname. Never raises."""
-    return await asyncio.to_thread(_collect_tls_sync, domain)
+    """Collect TLS evidence for a hostname. Never raises.
+
+    The blocking handshake runs on a bounded worker pool so the event loop is
+    never blocked and concurrent scans cannot exhaust the executor.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_TLS_EXECUTOR, _collect_tls_sync, domain)
