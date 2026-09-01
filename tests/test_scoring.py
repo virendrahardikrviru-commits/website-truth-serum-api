@@ -85,6 +85,32 @@ def test_domain_category_cap():
     assert result.score == 40.0
 
 
+def test_ssl_category_cap():
+    result = evaluate_evidence(
+        [
+            EvidenceItem(id="A", category="ssl", signal="x", effect=8.0,
+                         confidence=1.0, source="tls"),
+            EvidenceItem(id="B", category="ssl", signal="y", effect=8.0,
+                         confidence=1.0, source="tls"),
+        ]
+    )
+    assert result.category_contributions["ssl"] == 10.0  # capped, not 16
+    assert result.score == 60.0
+
+
+def test_http_category_cap():
+    result = evaluate_evidence(
+        [
+            EvidenceItem(id="A", category="http", signal="x", effect=3.0,
+                         confidence=1.0, source="http"),
+            EvidenceItem(id="B", category="http", signal="y", effect=3.0,
+                         confidence=1.0, source="http"),
+        ]
+    )
+    assert result.category_contributions["http"] == 5.0  # capped, not 6
+    assert result.score == 55.0
+
+
 # ---------- RDAP age rules ----------
 
 def test_old_domain_is_55():

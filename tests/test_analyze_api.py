@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.models.evidence import EvidenceItem
 
 client = TestClient(app)
 
@@ -41,6 +42,14 @@ def _no_network():
         "app.routers.analyze.rdap_lookup",
         new_callable=mock.AsyncMock,
         return_value=NEUTRAL_RDAP,
+    ), mock.patch(
+        "app.routers.analyze.collect_tls",
+        new_callable=mock.AsyncMock,
+        return_value=[],
+    ), mock.patch(
+        "app.routers.analyze.collect_http",
+        new_callable=mock.AsyncMock,
+        return_value=[],
     ):
         yield
 
@@ -329,3 +338,118 @@ def test_default_mode_is_legacy():
     assert data["ai_probability"] == 40.0
     assert data["confidence"] is None
     assert data["ssl_valid"] is True
+
+
+# ---------- Evidence mode: TLS + HTTP collectors ----------
+
+def _tls_item(effect, signal="ssl_valid"):
+    return EvidenceItem(
+        id="TLS_001" if effect > 0 else "TLS_ERR",
+        category="ssl",
+        signal=signal,
+        effect=effect,
+        confidence=1.0,
+        source="tls",
+        explanation=(
+            None
+            if effect > 0
+            else "TLS certificate verification failed during the connection handshake."
+        ),
+    )
+
+
+def _http_item(effect, signal="https_ok"):
+    return EvidenceItem(
+        id="HTTP_HTTPS",
+        category="http",
+        signal=signal,
+        effect=effect,
+        confidence=1.0,
+        source="http",
+    )
+
+
+def test_evidence_mode_tls_valid(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.collect_tls",
+        new_callable=mock.AsyncMock,
+        return_value=[_tls_item(8.0)],
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 58  # 50 + 8
+    assert data["category_contributions"]["ssl"] == 8.0
+    assert any(e["signal"] == "ssl_valid" for e in data["evidence"])
+
+
+def test_evidence_mode_tls_failure(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.collect_tls",
+        new_callable=mock.AsyncMock,
+        return_value=[_tls_item(-10.0, signal="ssl_error")],
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 40  # 50 - 10
+    assert any("TLS" in f for f in data["red_flags"])
+
+
+def test_evidence_mode_http_https(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.collect_http",
+        new_callable=mock.AsyncMock,
+        return_value=[_http_item(2.0)],
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 52  # 50 + 2
+    assert data["category_contributions"]["http"] == 2.0
+
+
+def test_evidence_mode_combined_rdap_tls_http(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.rdap_lookup",
+        new_callable=mock.AsyncMock,
+        return_value=_rdap(age_days=4000, status=["ok"]),
+    ), mock.patch(
+        "app.routers.analyze.collect_tls",
+        new_callable=mock.AsyncMock,
+        return_value=[_tls_item(8.0)],
+    ), mock.patch(
+        "app.routers.analyze.collect_http",
+        new_callable=mock.AsyncMock,
+        return_value=[_http_item(2.0)],
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 65  # 50 + 5 (domain) + 8 (ssl) + 2 (http)
+    assert data["category_contributions"] == {"domain": 5.0, "ssl": 8.0, "http": 2.0}
+    assert data["confidence"] == 0.53  # 3 of 11 planned categories usable
+    assert len(data["evidence"]) == 3
+
+
+def test_evidence_mode_collectors_never_crash_analyze(evidence_mode):
+    with mock.patch(
+        "app.routers.analyze.collect_tls",
+        new_callable=mock.AsyncMock,
+        side_effect=RuntimeError("tls boom"),
+    ), mock.patch(
+        "app.routers.analyze.collect_http",
+        new_callable=mock.AsyncMock,
+        side_effect=RuntimeError("http boom"),
+    ):
+        resp = _analyze()
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trust_score"] == 50  # collectors unavailable -> neutral
+    assert data["confidence"] == 0.0
+    assert data["evidence"] == []

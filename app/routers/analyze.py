@@ -8,6 +8,8 @@ import asyncio
 import re
 
 from app.models.evidence import EvidenceItem
+from app.services.collectors.http_behavior import collect_http
+from app.services.collectors.ssl import collect_tls
 from app.services.evidence import (
     evaluate_rdap_evidence,
     format_domain_age,
@@ -159,6 +161,7 @@ async def analyze_website(
     analysis = analyze_domain(domain)
 
     # Fetch real RDAP intelligence (shared by both scoring modes, never fatal).
+    normalized = None
     rdap = None
     domain_intel = None
     try:
@@ -194,16 +197,25 @@ async def analyze_website(
 
     if scoring_mode == "evidence":
         items = rdap_evidence_items(rdap) if rdap is not None else []
+        if normalized is not None:
+            try:
+                items = items + await collect_tls(normalized)
+            except Exception:
+                pass  # a collector must never break the analysis
+            try:
+                items = items + await collect_http(str(request.url))
+            except Exception:
+                pass
         result = evaluate_evidence(items)
         trust_score = result.score
         confidence = result.confidence
         risk_level = result.risk_level
         category = result.category
-        ai_probability = None  # not measured in Phase 2a
+        ai_probability = None  # not measured until a content collector exists
         red_flags = list(result.negative_signals)
         green_flags = list(result.positive_signals)
         notes = list(result.notes)
-        ssl_valid = None  # not measured in Phase 2a
+        ssl_valid = None  # TLS validity is represented by ssl evidence, not this field
         applied_evidence = result.applied_evidence
         category_contributions = result.category_contributions
         domain_age = (

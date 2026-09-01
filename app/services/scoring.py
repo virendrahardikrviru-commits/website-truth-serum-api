@@ -31,6 +31,8 @@ MAX_SIGNAL_EFFECT = 10.0
 # becomes active when its collector actually exists and is trusted.
 CATEGORY_CAPS: Dict[str, float] = {
     "domain": 10.0,
+    "ssl": 10.0,
+    "http": 5.0,
 }
 
 # The full planned evidence surface. Used as the confidence denominator so
