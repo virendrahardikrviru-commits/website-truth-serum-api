@@ -8,10 +8,27 @@ on its own).
 
 All effects are small (+/-1) so the whole category stays within its +/-5 cap,
 and no single header exceeds the per-signal limit.
+
+Additional observations (Phase V1.3.1), all derived from the same response
+headers and requiring no extra request:
+
+- ``coop`` / ``corp`` / ``coep`` / ``csp_report_only``: +1 when the header is
+  present and non-empty (0 when present but empty). Absent is neutral.
+- ``cookie_security``: a neutral (effect 0) audit appended only when an
+  HTTPS-served response sets cookies AND the category is already measured by
+  another security-header item from the same response, so an audit never
+  independently marks the category usable. It records only safe
+  boolean/attribute facts (Secure/HttpOnly/SameSite presence aggregated across
+  cookies). Raw Set-Cookie values are never stored, returned or logged, and a
+  missing attribute is never a penalty by itself.
+- ``framing``: a neutral (effect 0) audit appended when X-Frame-Options
+  (deny/sameorigin) and CSP ``frame-ancestors`` are both present. The
+  ``csp_frame_ancestors`` signal keeps its V1.2 behavior unchanged (+1 whenever
+  the directive is present).
 """
 
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -53,10 +70,16 @@ _ITEM_IDS = {
     "x_frame_options": "HDR_XFO",
     "referrer_policy": "HDR_REFERRER",
     "permissions_policy": "HDR_PERMISSIONS",
+    "coop": "HDR_COOP",
+    "corp": "HDR_CORP",
+    "coep": "HDR_COEP",
+    "csp_report_only": "HDR_CSPRO",
+    "cookie_security": "HDR_COOKIE",
+    "framing": "HDR_FRAMING",
 }
 
 
-def _item(signal: str, value: Optional[str], effect: float, explanation: str) -> EvidenceItem:
+def _item(signal: str, value: Optional[Any], effect: float, explanation: str) -> EvidenceItem:
     return EvidenceItem(
         id=_ITEM_IDS[signal],
         category="security_headers",
@@ -81,8 +104,103 @@ def _parse_max_age(value: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def _analyze_headers(headers) -> List[EvidenceItem]:
-    """Convert observed response headers into EvidenceItems (pure function)."""
+_ADDITIONAL_HEADERS = (
+    ("cross-origin-opener-policy", "coop", "Cross-Origin-Opener-Policy"),
+    ("cross-origin-resource-policy", "corp", "Cross-Origin-Resource-Policy"),
+    ("cross-origin-embedder-policy", "coep", "Cross-Origin-Embedder-Policy"),
+    ("content-security-policy-report-only", "csp_report_only",
+     "Content-Security-Policy-Report-Only"),
+)
+
+
+def _set_cookie_values(headers) -> List[str]:
+    """Return the individual Set-Cookie header values present on a response."""
+    values: List[str] = []
+    if hasattr(headers, "get_list"):
+        values = headers.get_list("set-cookie")
+    if not values:
+        raw = headers.get("set-cookie")
+        if raw:
+            values = [raw]
+    return values
+
+
+def _cookie_attribute_facts(values: List[str]) -> Dict[str, Any]:
+    """Aggregate cookie security attributes into safe boolean/attribute facts.
+
+    Raw cookie names/values are never captured. ``secure_all`` / ``httponly_all``
+    / ``samesite_all`` are true only when every cookie carries the attribute.
+    ``samesite_values`` is the sorted set of observed SameSite policy values.
+    """
+    secure_all = True
+    httponly_all = True
+    samesite_all = True
+    samesite_values: set = set()
+    for value in values:
+        parts = value.split(";")
+        has_secure = False
+        has_httponly = False
+        has_samesite = False
+        for part in parts[1:]:
+            token = part.strip()
+            lower = token.lower()
+            if lower == "secure":
+                has_secure = True
+            elif lower == "httponly":
+                has_httponly = True
+            elif lower.startswith("samesite"):
+                has_samesite = True
+                if "=" in token:
+                    policy = token.split("=", 1)[1].strip().lower()
+                    if policy:
+                        samesite_values.add(policy)
+        secure_all = secure_all and has_secure
+        httponly_all = httponly_all and has_httponly
+        samesite_all = samesite_all and has_samesite
+    return {
+        "cookie_count": len(values),
+        "secure_all": secure_all,
+        "httponly_all": httponly_all,
+        "samesite_all": samesite_all,
+        "samesite_values": sorted(samesite_values),
+    }
+
+
+def _cookie_security_item(values: List[str]) -> Optional[EvidenceItem]:
+    """Neutral (effect 0) audit of cookie attribute hygiene for an HTTPS page.
+
+    Only safe facts are stored; missing attributes never produce a penalty.
+    """
+    if not values:
+        return None
+    facts = _cookie_attribute_facts(values)
+    return EvidenceItem(
+        id=_ITEM_IDS["cookie_security"],
+        category="security_headers",
+        signal="cookie_security",
+        value=facts,
+        effect=0.0,
+        confidence=1.0,
+        source="security_headers",
+        explanation=(
+            f"HTTPS response sets {facts['cookie_count']} cookie(s); "
+            f"Secure set on all: {facts['secure_all']}; HttpOnly set on all: "
+            f"{facts['httponly_all']}; SameSite set on all: {facts['samesite_all']}."
+        ),
+    )
+
+
+def _analyze_headers(headers, scheme: Optional[str] = None) -> List[EvidenceItem]:
+    """Convert observed response headers into EvidenceItems (pure function).
+
+    ``scheme`` is the final page scheme observed by the fetch. It gates the
+    neutral ``cookie_security`` audit: cookie attributes are only audited for
+    HTTPS-served responses (on a plain-HTTP page the whole exchange is already
+    insecure by transport and HTTP reachability is never penalized). Neutral
+    audits (``cookie_security``, ``framing``) are only appended when the
+    category is already measured by a security-header item, so they can never
+    be the sole item that makes the category usable.
+    """
     items: List[EvidenceItem] = []
 
     hsts = _present(headers, "strict-transport-security")
@@ -110,6 +228,7 @@ def _analyze_headers(headers) -> List[EvidenceItem]:
             ))
 
     csp = _present(headers, "content-security-policy")
+    csp_frame_ancestors_present = False
     if csp is not None:
         if not csp:
             items.append(_item(
@@ -122,6 +241,7 @@ def _analyze_headers(headers) -> List[EvidenceItem]:
                 "Content-Security-Policy is present.",
             ))
             if "frame-ancestors" in csp.lower():
+                csp_frame_ancestors_present = True
                 items.append(_item(
                     "csp_frame_ancestors", csp, 1.0,
                     "Content-Security-Policy includes frame-ancestors (framing protection).",
@@ -140,9 +260,11 @@ def _analyze_headers(headers) -> List[EvidenceItem]:
                 "X-Content-Type-Options has an invalid value (expected nosniff).",
             ))
 
+    xfo_protective = False
     xfo = _present(headers, "x-frame-options")
     if xfo is not None:
         if xfo.lower() in {"deny", "sameorigin"}:
+            xfo_protective = True
             items.append(_item(
                 "x_frame_options", xfo, 1.0,
                 "X-Frame-Options provides framing protection.",
@@ -182,6 +304,33 @@ def _analyze_headers(headers) -> List[EvidenceItem]:
                 "Permissions-Policy header is present but empty.",
             ))
 
+    for header, signal, label in _ADDITIONAL_HEADERS:
+        value = _present(headers, header)
+        if value is not None:
+            if value:
+                items.append(_item(
+                    signal, value, 1.0,
+                    f"{label} header is present.",
+                ))
+            else:
+                items.append(_item(
+                    signal, value, 0.0,
+                    f"{label} header is present but empty.",
+                ))
+
+    if scheme == "https" and items:
+        cookie_values = _set_cookie_values(headers)
+        cookie_item = _cookie_security_item(cookie_values)
+        if cookie_item is not None:
+            items.append(cookie_item)
+
+    if xfo_protective and csp_frame_ancestors_present:
+        items.append(_item(
+            "framing", True, 0.0,
+            "Framing protection is redundant and consistent: X-Frame-Options "
+            "and a CSP frame-ancestors are both present.",
+        ))
+
     return items
 
 
@@ -189,11 +338,14 @@ def analyze_headers_response(response: Optional[httpx.Response]) -> List[Evidenc
     """Derive security-header evidence from an already-fetched response.
 
     Pure and deterministic; used by the evidence orchestrator to reuse the
-    single SSRF-validated page response instead of issuing a second GET.
+    single SSRF-validated page response instead of issuing a second GET. The
+    final page scheme gates the neutral cookie-attribute audit.
     """
     if response is None:
         return []
-    return _analyze_headers(response.headers)
+    url = getattr(response, "url", None)
+    scheme = getattr(url, "scheme", None)
+    return _analyze_headers(response.headers, scheme=scheme)
 
 
 async def collect_security_headers(

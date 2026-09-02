@@ -7,7 +7,7 @@ from unittest import mock
 import httpx
 
 from app.models.evidence import EvidenceItem
-from app.services.collectors.http_behavior import collect_http
+from app.services.collectors.http_behavior import analyze_http_response, collect_http
 from app.services.collectors.ssl import days_until_expiry, collect_tls
 from app.services.evidence import rdap_evidence_items
 from app.services.scoring import evaluate_evidence
@@ -380,6 +380,66 @@ def test_http_plain_http_not_penalized():
         "http://example.com/", lambda req: httpx.Response(200, text="ok")
     )
     assert items == []
+
+
+# ---------- V1.3.1: HTTPS -> HTTP scheme downgrade (pure) ----------
+
+def _final_response(url: str, status: int = 200) -> httpx.Response:
+    return httpx.Response(status, text="ok", request=httpx.Request("GET", url))
+
+
+def test_https_to_http_downgrade_is_small_negative():
+    items = analyze_http_response(
+        _final_response("http://example.com/"), "https://example.com/"
+    )
+    signals = {i.signal: i.effect for i in items}
+    assert signals == {"https_downgrade": -1.0}
+    item = items[0]
+    assert item.category == "http"
+    assert item.source == "http"
+    assert item.confidence == 1.0
+    # value carries only safe numeric facts, never a URL or header value.
+    assert item.value == {"status_code": 200, "redirect_count": 0}
+
+
+def test_no_downgrade_when_https_served():
+    items = analyze_http_response(
+        _final_response("https://example.com/"), "https://example.com/"
+    )
+    signals = {i.signal: i.effect for i in items}
+    assert signals == {"https_ok": 2.0}
+
+
+def test_plain_http_request_reaching_http_is_neutral():
+    # HTTP reachability itself is never a negative (V1.2 invariant).
+    items = analyze_http_response(
+        _final_response("http://example.com/"), "http://example.com/"
+    )
+    assert items == []
+
+
+def test_downgrade_detected_on_deep_path():
+    items = analyze_http_response(
+        _final_response("http://example.com/some/page"), "https://example.com/some/page"
+    )
+    assert {i.signal for i in items} == {"https_downgrade"}
+
+
+def test_downgrade_error_page_is_not_entry_error():
+    # http_entry_error only fires on an HTTPS final page; an HTTPS->HTTP
+    # downgrade to an error page records only the downgrade.
+    items = analyze_http_response(
+        _final_response("http://example.com/", status=503), "https://example.com/"
+    )
+    signals = {i.signal: i.effect for i in items}
+    assert signals == {"https_downgrade": -1.0}
+
+
+def test_no_response_no_downgrade_evidence():
+    assert analyze_http_response(None, "https://example.com/") == []
+    assert analyze_http_response(
+        None, "https://example.com/", redirect_loop=True
+    )[0].signal == "redirect_loop"
 
 
 # ---------- Evidence assembly: RDAP + TLS + HTTP -> engine ----------

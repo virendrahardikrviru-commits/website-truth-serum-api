@@ -1,4 +1,5 @@
 from datetime import date
+import contextlib
 import os
 from unittest import mock
 
@@ -8,6 +9,12 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.evidence import EvidenceItem
+from app.services.collectors.http_behavior import (
+    analyze_http_response as real_analyze_http_response,
+)
+from app.services.collectors.security_headers import (
+    analyze_headers_response as real_analyze_headers_response,
+)
 from app.services.rate_limit import SlidingWindowRateLimiter
 
 client = TestClient(app)
@@ -548,3 +555,114 @@ def test_evidence_mode_reputation_enabled(evidence_mode):
     assert data["trust_score"] == 44  # 50 + (-10 * 0.6)
     assert data["category_contributions"]["reputation"] == -6.0
     assert any(e["signal"] == "malware_hit" for e in data["evidence"])
+
+
+# ================================================================
+# V1.3.1: derived HTTP/security-header signals through the endpoint
+# (real pure analyzers run on the single retained page response)
+# ================================================================
+
+def _enter_derived_evidence(stack, transport, rdap=None, content=None):
+    """Enter evidence-mode mocks that keep the http/headers analyzers real."""
+    stack.enter_context(mock.patch.dict(os.environ, {"SCORING_MODE": "evidence"}))
+    stack.enter_context(mock.patch("app.routers.analyze._page_fetch_transport", transport))
+    stack.enter_context(
+        mock.patch(
+            "app.routers.analyze.rdap_lookup",
+            new_callable=mock.AsyncMock,
+            return_value=rdap if rdap is not None else NEUTRAL_RDAP,
+        )
+    )
+    stack.enter_context(
+        mock.patch("app.routers.analyze.collect_tls", new_callable=mock.AsyncMock, return_value=[])
+    )
+    stack.enter_context(
+        mock.patch("app.routers.analyze.analyze_http_response", new=real_analyze_http_response)
+    )
+    stack.enter_context(
+        mock.patch("app.routers.analyze.analyze_headers_response", new=real_analyze_headers_response)
+    )
+    stack.enter_context(
+        mock.patch("app.routers.analyze.analyze_page_content", return_value=content if content is not None else [])
+    )
+
+
+def test_evidence_mode_https_downgrade_is_small_negative(evidence_mode):
+    calls = {"https": 0, "http": 0}
+
+    def handler(req):
+        if req.url.scheme == "https":
+            calls["https"] += 1
+            return httpx.Response(301, headers={"location": "http://example.com/"})
+        calls["http"] += 1
+        return httpx.Response(200, text="<html><title>x</title></html>")
+
+    transport = httpx.MockTransport(handler)
+    with contextlib.ExitStack() as stack:
+        _enter_derived_evidence(stack, transport)
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["category_contributions"]["http"] == -1.0
+    assert any("downgrade" in f.lower() for f in data["red_flags"])
+    assert data["trust_score"] == 49.0  # 50 - 1
+    # One initial GET; the only extra hop is the redirect inside that fetch.
+    assert calls == {"https": 1, "http": 1}
+    sigs = {e["signal"] for e in data["evidence"]}
+    assert sigs == {"https_downgrade"}
+    assert data["transparency"]["verified"][0]["signal"] == "https_downgrade"
+
+
+def test_evidence_mode_cookie_values_never_serialized(evidence_mode):
+    def handler(req):
+        return httpx.Response(
+            200,
+            text="<html><title>x</title></html>",
+            headers={
+                "set-cookie": "session=SECRETCOOKIEVALUE123; Path=/; Secure; HttpOnly; SameSite=Lax",
+                "cross-origin-opener-policy": "same-origin",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    with contextlib.ExitStack() as stack:
+        _enter_derived_evidence(stack, transport)
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    text = resp.text
+    assert "SECRETCOOKIEVALUE123" not in text
+    data = resp.json()
+    sigs = {e["signal"] for e in data["evidence"]}
+    assert "cookie_security" in sigs
+    assert "coop" in sigs
+    # https_ok (+2) + coop (+1); cookie audit is 0-effect.
+    assert data["category_contributions"]["security_headers"] == 1.0
+    assert data["category_contributions"]["http"] == 2.0
+    assert data["trust_score"] == 53.0
+    cookie_item = next(e for e in data["evidence"] if e["signal"] == "cookie_security")
+    assert set(cookie_item["value"]) == {
+        "cookie_count", "secure_all", "httponly_all", "samesite_all", "samesite_values",
+    }
+    assert cookie_item["effect"] == 0.0
+
+
+def test_evidence_mode_absent_new_signals_leave_score_neutral(evidence_mode):
+    # A normal HTTPS page carrying none of the new signals stays neutral.
+    def handler(req):
+        return httpx.Response(200, text="<html><title>x</title></html>")
+
+    transport = httpx.MockTransport(handler)
+    with contextlib.ExitStack() as stack:
+        _enter_derived_evidence(stack, transport)
+        resp = _analyze("https://example.com/")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["category_contributions"]["http"] == 2.0  # https_ok unchanged
+    assert data["category_contributions"].get("security_headers") is None
+    sigs = {e["signal"] for e in data["evidence"]}
+    assert "cookie_security" not in sigs
+    assert "framing" not in sigs
+    assert not ({"coop", "corp", "coep", "csp_report_only"} & sigs)

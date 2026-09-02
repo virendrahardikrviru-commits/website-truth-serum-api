@@ -5,6 +5,11 @@ maximum number of redirects, then records the observed behavior:
 
 - HTTPS endpoint reached successfully -> ``+2``.
 - HTTP -> HTTPS redirect observed -> ``+2``.
+- HTTPS -> HTTP transport downgrade observed (a request for HTTPS was
+  answered over plain HTTP) -> ``-1``. This is the scheme-mirror of the
+  upgrade signal and can only occur through a redirect hop (the fetch itself
+  is TLS). Plain-HTTP reachability (original scheme ``http``) is never
+  penalized here.
 - Redirect loop / excessive redirects -> ``-3``.
 - Connection / timeout / unavailable -> no evidence, no penalty.
 
@@ -102,6 +107,25 @@ def analyze_http_response(
                 confidence=1.0,
                 source="http",
                 explanation="Site redirects HTTP traffic to HTTPS.",
+            )
+        )
+    if original_scheme == "https" and final_scheme == "http":
+        items.append(
+            EvidenceItem(
+                id="HTTP_DOWNGRADE",
+                category="http",
+                signal="https_downgrade",
+                value={
+                    "status_code": status_code,
+                    "redirect_count": redirect_count,
+                },
+                effect=-1.0,
+                confidence=1.0,
+                source="http",
+                explanation=(
+                    "The site downgraded the request transport from HTTPS to "
+                    "HTTP for the final page."
+                ),
             )
         )
     # http_entry_error: the site's primary (root) page answered with an error
