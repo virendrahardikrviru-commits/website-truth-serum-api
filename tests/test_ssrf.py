@@ -109,7 +109,7 @@ def test_redirect_guard_blocks_non_public_targets():
 def test_redirect_to_non_public_host_blocked_at_endpoint():
     captured = {}
 
-    def spy(html):
+    def spy(html, scheme=None):
         captured["html"] = html
         return []
 
@@ -151,7 +151,7 @@ def test_page_body_size_capped():
     payload = f"<html><body>{'a' * (MAX_PAGE_BYTES + 5000)}</body></html>"
     captured = {}
 
-    def spy(html):
+    def spy(html, scheme=None):
         captured["html"] = html
         return []
 
@@ -274,7 +274,7 @@ def test_oversized_streamed_body_stays_bounded_end_to_end():
     # be fully buffered; the content collector receives the bounded text only.
     captured = {}
 
-    def spy(html):
+    def spy(html, scheme=None):
         captured["html"] = html
         return []
 

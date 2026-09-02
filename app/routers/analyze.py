@@ -434,7 +434,14 @@ async def analyze_website(
 
             try:
                 _started = time.monotonic()
-                content_items = analyze_page_content(html)
+                # The transport-hygiene content signals are gated on the final
+                # page scheme actually observed (mixed content only on HTTPS,
+                # insecure login only on HTTP). No scheme (page unavailable)
+                # keeps them neutral.
+                content_scheme = (
+                    page_response.url.scheme if page_response is not None else None
+                )
+                content_items = analyze_page_content(html, scheme=content_scheme)
                 items = items + content_items
                 _log_sync("content", _started, content_items)
             except Exception:

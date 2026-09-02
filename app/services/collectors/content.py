@@ -9,9 +9,20 @@ Rules enforced here:
 - Missing *optional* metadata (description, lang, viewport, canonical, alt)
   is neutral — never penalized.
 - A short/minimal document is never penalized on its own; there is no
-  ``empty_page`` signal. The only negative is ``no_title``, and it fires only
-  when a page has substantial text content yet is missing a <title>.
+  ``empty_page`` signal. The only legacy negative is ``no_title``, and it
+  fires only when a page has substantial text content yet is missing a
+  <title>.
 - ``html=None`` or an empty document produces no evidence (unavailable).
+
+Transport-hygiene signals (Phase V1.2), derived only from the fetched page:
+
+- ``insecure_mixed_content`` (``-1``): only on an HTTPS-served page that
+  references subresources over absolute ``http://`` URLs in the listed tags.
+  Absence is neutral, never a positive.
+- ``insecure_login`` (``-2``): only on an HTTP-served page that contains a
+  password input whose form does not submit over HTTPS. HTTPS pages and
+  https-posting forms never receive it. No password input is neutral.
+
 
 Anti-inflation (Phase 2c-4):
 
@@ -41,6 +52,8 @@ _IDS = {
     "metadata_quality": "CONTENT_META",
     "substantial_content": "CONTENT_SIZE",
     "no_title": "CONTENT_NO_TITLE",
+    "insecure_mixed_content": "CONTENT_MIXED",
+    "insecure_login": "CONTENT_LOGIN",
 }
 
 # Routine metadata observations that are aggregated into metadata_quality.
@@ -51,6 +64,26 @@ _METADATA_SIGNALS = (
     "viewport_present",
     "canonical_present",
     "alt_text_present",
+)
+
+# Tags whose resource URL can load third-party content (mixed content risk).
+_MIXED_CONTENT_TAG_RE = re.compile(
+    r"<(?:img|script|link|iframe|video|audio|source|object|form)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+# Absolute insecure scheme present in a resource-carrying attribute.
+_HTTP_RESOURCE_ATTR_RE = re.compile(
+    r"\b(?:src|href|action|data)\s*=\s*[\"']http://",
+    re.IGNORECASE,
+)
+
+# A <form> with its opening tag + body, for password-submission analysis.
+_FORM_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.IGNORECASE | re.DOTALL)
+
+# A password input anywhere (type attribute in either attribute order).
+_PASSWORD_INPUT_RE = re.compile(
+    r"<input\b[^>]*\btype\s*=\s*[\"']password[\"']", re.IGNORECASE
 )
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -114,8 +147,56 @@ def _metadata_effect(count: int) -> float:
     return 0.0
 
 
-def analyze_page_content(html: Optional[str]) -> List[EvidenceItem]:
-    """Analyze fetched HTML and return content evidence. Never raises."""
+def _count_mixed_content_refs(html: str) -> int:
+    """Count resource-carrying tags whose absolute scheme is insecure ``http``.
+
+    Only tags that can load remote content are considered (img, script, link,
+    iframe, video, audio, source, object and form action). Plain anchor links
+    are excluded: a normal page linking out to an ``http`` site is not mixed
+    content.
+    """
+    count = 0
+    for tag in _MIXED_CONTENT_TAG_RE.findall(html):
+        if _HTTP_RESOURCE_ATTR_RE.search(tag):
+            count += 1
+    return count
+
+
+def _has_insecure_login_form(html: str) -> bool:
+    """True when an HTTP-served page contains a password input whose <form>
+    does not submit over HTTPS.
+
+    A form that posts to ``https://`` (or whose enclosing page is HTTPS) is
+    never flagged here; callers gate on the served scheme first. Password
+    inputs not wrapped in a detectable <form> are neutral (their submission
+    target is unknown).
+    """
+    if _PASSWORD_INPUT_RE.search(html) is None:
+        return False
+    for form_match in _FORM_RE.finditer(html):
+        opening_tag = form_match.group(1).strip()
+        body = form_match.group(2)
+        if not _PASSWORD_INPUT_RE.search(body):
+            continue
+        action = _attr_value(f"<form {opening_tag}>", "action")
+        # No action (posts back to the current HTTP page) or a relative/HTTP
+        # action means the credentials travel insecurely.
+        if action is None or not action.strip().lower().startswith("https://"):
+            return True
+    return False
+
+
+def analyze_page_content(
+    html: Optional[str], scheme: Optional[str] = None
+) -> List[EvidenceItem]:
+    """Analyze fetched HTML and return content evidence. Never raises.
+
+    ``scheme`` is the final page scheme observed by the fetch (``https`` or
+    ``http``). The transport-hygiene signals are gated on it: mixed content
+    applies only to HTTPS-served pages, insecure login only to HTTP-served
+    pages. A ``None`` scheme (page unavailable) suppresses both, keeping them
+    neutral.
+    """
     if not isinstance(html, str) or not html.strip():
         return []
 
@@ -174,5 +255,23 @@ def analyze_page_content(html: Optional[str]) -> List[EvidenceItem]:
             "no_title", None, -1.0,
             "A page with substantial content has no <title> element.",
         ))
+
+    # Transport hygiene (gated on the final page scheme; see docstring).
+    if scheme == "https":
+        insecure_refs = _count_mixed_content_refs(html)
+        if insecure_refs > 0:
+            items.append(_item(
+                "insecure_mixed_content", insecure_refs, -1.0,
+                (
+                    f"Page served over HTTPS references {insecure_refs} "
+                    "subresource(s) over insecure HTTP."
+                ),
+            ))
+    elif scheme == "http":
+        if _has_insecure_login_form(html):
+            items.append(_item(
+                "insecure_login", True, -2.0,
+                "A password form on an HTTP-served page does not submit over HTTPS.",
+            ))
 
     return items

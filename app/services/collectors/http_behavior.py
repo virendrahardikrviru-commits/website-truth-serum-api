@@ -75,7 +75,10 @@ def analyze_http_response(
     }
 
     items: List[EvidenceItem] = []
-    if final_scheme == "https":
+    # https_ok rewards genuine reachability: an HTTPS endpoint that actually
+    # answered with a successful status. An error response (4xx/5xx) means the
+    # site is reachable but NOT serving normally, so it is never credited here.
+    if final_scheme == "https" and 200 <= status_code < 400:
         items.append(
             EvidenceItem(
                 id="HTTP_HTTPS",
@@ -99,6 +102,26 @@ def analyze_http_response(
                 confidence=1.0,
                 source="http",
                 explanation="Site redirects HTTP traffic to HTTPS.",
+            )
+        )
+    # http_entry_error: the site's primary (root) page answered with an error
+    # status over HTTPS. A degraded homepage is a real negative signal; a 4xx
+    # on a deep scanned path is the scanned URL's fault, not the site's, so it
+    # stays neutral. HTTP-only pages are never penalized here.
+    if final_scheme == "https" and urlparse(original_url).path in ("", "/") and status_code >= 400:
+        items.append(
+            EvidenceItem(
+                id="HTTP_ENTRY_ERR",
+                category="http",
+                signal="http_entry_error",
+                value=facts,
+                effect=-2.0,
+                confidence=1.0,
+                source="http",
+                explanation=(
+                    f"The site's primary page returned HTTP error status "
+                    f"{status_code} over HTTPS."
+                ),
             )
         )
     return items

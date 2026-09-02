@@ -127,6 +127,115 @@ def test_empty_or_none_html_is_neutral():
     assert analyze_page_content(None) == []
     assert analyze_page_content("") == []
     assert analyze_page_content("   \n  ") == []
+    # Even with a scheme, no body means no evidence.
+    assert analyze_page_content(None, scheme="https") == []
+    assert analyze_page_content(None, scheme="http") == []
+
+
+# ---------- V1.2: transport-hygiene signals ----------
+
+def test_https_page_with_http_subresource_mixed_content():
+    html = (
+        '<html><head><title>T</title></head><body>'
+        '<img src="http://cdn.example.com/a.png">'
+        '<script src="http://cdn.example.com/app.js"></script>'
+        "</body></html>"
+    )
+    items = analyze_page_content(html, scheme="https")
+    mixed = [i for i in items if i.signal == "insecure_mixed_content"]
+    assert len(mixed) == 1
+    assert mixed[0].effect == -1.0
+    assert mixed[0].value == 2
+    assert mixed[0].category == "content"
+
+
+def test_https_page_no_http_subresources_no_mixed_item():
+    items = analyze_page_content(RICH, scheme="https")
+    assert all(i.signal != "insecure_mixed_content" for i in items)
+    assert "insecure_login" not in {i.signal for i in items}
+
+
+def test_http_page_with_http_resources_no_mixed_signal():
+    # Mixed content only applies to HTTPS-served pages.
+    html = (
+        '<html><head><title>T</title></head><body>'
+        '<img src="http://cdn.example.com/a.png">'
+        "</body></html>"
+    )
+    items = analyze_page_content(html, scheme="http")
+    assert all(i.signal != "insecure_mixed_content" for i in items)
+
+
+def test_http_password_form_posting_http_insecure_login():
+    html = (
+        '<html><head><title>Login</title></head><body>'
+        '<form action="http://example.com/login" method="post">'
+        '<input type="password" name="pw">'
+        "</form></body></html>"
+    )
+    items = analyze_page_content(html, scheme="http")
+    login = [i for i in items if i.signal == "insecure_login"]
+    assert len(login) == 1
+    assert login[0].effect == -2.0
+
+
+def test_http_password_form_relative_action_insecure_login():
+    # A relative action posts back to the current HTTP page.
+    html = (
+        '<html><head><title>Login</title></head><body>'
+        '<form action="/login" method="post">'
+        '<input type="password" name="pw">'
+        "</form></body></html>"
+    )
+    items = analyze_page_content(html, scheme="http")
+    assert any(i.signal == "insecure_login" for i in items)
+
+
+def test_http_password_form_posting_https_neutral():
+    html = (
+        '<html><head><title>Login</title></head><body>'
+        '<form action="https://example.com/login" method="post">'
+        '<input type="password" name="pw">'
+        "</form></body></html>"
+    )
+    items = analyze_page_content(html, scheme="http")
+    assert all(i.signal != "insecure_login" for i in items)
+
+
+def test_https_password_form_no_insecure_login():
+    html = (
+        '<html><head><title>Login</title></head><body>'
+        '<form action="/login" method="post">'
+        '<input type="password" name="pw">'
+        "</form></body></html>"
+    )
+    items = analyze_page_content(html, scheme="https")
+    assert all(i.signal != "insecure_login" for i in items)
+
+
+def test_no_password_input_is_neutral():
+    html = (
+        '<html><head><title>Search</title></head><body>'
+        '<form action="/search"><input type="text" name="q"></form>'
+        "</body></html>"
+    )
+    items = analyze_page_content(html, scheme="http")
+    assert all(i.signal not in ("insecure_login", "insecure_mixed_content") for i in items)
+
+
+def test_no_scheme_suppresses_transport_signals():
+    # When no page scheme is known (page unavailable) both hygiene signals stay
+    # neutral even if the HTML would otherwise trigger them.
+    html = (
+        '<html><head><title>Login</title></head><body>'
+        '<img src="http://cdn.example.com/a.png">'
+        '<form action="/login"><input type="password" name="pw"></form>'
+        "</body></html>"
+    )
+    items = analyze_page_content(html)
+    assert all(
+        i.signal not in ("insecure_login", "insecure_mixed_content") for i in items
+    )
 
 
 # ---------- Content category behaviour in the engine ----------
