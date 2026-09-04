@@ -8,7 +8,7 @@ load_dotenv()
 app = FastAPI(
     title="Website Truth Serum API",
     description="Analyze websites for trustworthiness and AI-generated content",
-    version="1.0.0"
+    version="1.3.1"
 )
 
 # CORS setup - Allow specific origins for production
@@ -35,7 +35,7 @@ async def root():
     return {
         "message": "Website Truth Serum API",
         "status": "running",
-        "version": "1.0.0"
+        "version": "1.3.1"
     }
 
 @app.get("/health")
